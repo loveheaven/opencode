@@ -1,0 +1,223 @@
+{
+  "name": "opencode-vscode",
+  "displayName": "OpenCode",
+  "description": "OpenCode chat inside VSCode. Talks to a local opencode server over its HTTP API.",
+  "version": "0.25.0",
+  "private": true,
+  "publisher": "opencode-ai",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "extensionKind": ["workspace", "ui"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "opencode",
+          "title": "OpenCode",
+          "icon": "$(comment-discussion)"
+        }
+      ]
+    },
+    "views": {
+      "opencode": [
+        {
+          "id": "opencode.chat",
+          "name": "Chat",
+          "type": "webview",
+          "contextualTitle": "OpenCode"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "opencode.open",
+        "title": "OpenCode: Open Chat Panel",
+        "category": "OpenCode"
+      },
+      {
+        "command": "opencode.newSession",
+        "title": "New Session",
+        "category": "OpenCode",
+        "icon": "$(add)"
+      },
+      {
+        "command": "opencode.showSessions",
+        "title": "Show Sessions",
+        "category": "OpenCode",
+        "icon": "$(list-unordered)"
+      },
+      {
+        "command": "opencode.reload",
+        "title": "OpenCode: Reload Panel",
+        "category": "OpenCode",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "opencode.restartServer",
+        "title": "OpenCode: Restart Server",
+        "category": "OpenCode"
+      },
+      {
+        "command": "opencode.showLogs",
+        "title": "OpenCode: Show Logs",
+        "category": "OpenCode"
+      },
+      {
+        "command": "opencode.showSettings",
+        "title": "OpenCode: Show Settings",
+        "category": "OpenCode",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "opencode.addToChat",
+        "title": "Add to OpenCode Chat",
+        "category": "OpenCode"
+      },
+      {
+        "command": "opencode.addSelectionToChat",
+        "title": "Add Selection to OpenCode Chat",
+        "category": "OpenCode"
+      }
+    ],
+    "configuration": {
+      "title": "OpenCode",
+      "properties": {
+        "opencode.serverMode": {
+          "type": "string",
+          "enum": ["spawn", "external"],
+          "default": "spawn",
+          "enumDescriptions": [
+            "The extension spawns `bun run serve` from the opencode repo and manages its lifecycle.",
+            "Connect to an already-running server at opencode.serverUrl."
+          ]
+        },
+        "opencode.serverUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:4096",
+          "description": "External server URL (used only when opencode.serverMode = external)."
+        },
+        "opencode.port": {
+          "type": "number",
+          "default": 0,
+          "description": "Preferred TCP port when spawning the server. 0 means auto-pick a stable port derived from the workspace path (recommended)."
+        },
+        "opencode.launcher": {
+          "type": "string",
+          "enum": ["auto", "cli", "source"],
+          "default": "auto",
+          "enumDescriptions": [
+            "Prefer the installed opencode CLI; fall back to a source checkout via bun.",
+            "Only use the installed opencode CLI (npm i -g opencode). Offers to install if missing.",
+            "Only use a source checkout via bun (developer mode)."
+          ]
+        },
+        "opencode.opencodePath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the opencode CLI binary. Leave empty to auto-detect on PATH."
+        },
+        "opencode.bunPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the bun binary (only used in source mode). Leave empty to auto-detect."
+        },
+        "opencode.repoPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the opencode repo root (the folder containing packages/opencode). Leave empty to auto-detect from the workspace folder."
+        },
+        "opencode.defaultAgent": {
+          "type": "string",
+          "default": "",
+          "description": "Default agent name (empty = server default)."
+        },
+        "opencode.defaultModel": {
+          "type": "string",
+          "default": "",
+          "description": "Default model in the form providerID/modelID (empty = server default)."
+        }
+      }
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "opencode.newSession",
+          "when": "view == opencode.chat",
+          "group": "navigation@1"
+        },
+        {
+          "command": "opencode.showSessions",
+          "when": "view == opencode.chat",
+          "group": "navigation@2"
+        },
+        {
+          "command": "opencode.reload",
+          "when": "view == opencode.chat",
+          "group": "navigation@3"
+        },
+        {
+          "command": "opencode.showSettings",
+          "when": "view == opencode.chat",
+          "group": "navigation@4"
+        },
+        {
+          "command": "opencode.restartServer",
+          "when": "view == opencode.chat",
+          "group": "overflow@1"
+        },
+        {
+          "command": "opencode.showLogs",
+          "when": "view == opencode.chat",
+          "group": "overflow@2"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "opencode.addToChat",
+          "group": "5_ai_chat@100"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "opencode.addSelectionToChat",
+          "when": "editorHasSelection",
+          "group": "5_ai_chat@100"
+        },
+        {
+          "command": "opencode.addToChat",
+          "when": "!editorHasSelection",
+          "group": "5_ai_chat@100"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "opencode.addToChat",
+          "group": "5_ai_chat@100"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build:ext": "bun build ./src/extension.ts --outdir ./dist --target node --external vscode --format cjs",
+    "build:web": "bun build ./src/webview/main.ts --outdir ./dist/webview --target browser --format iife --minify",
+    "build": "bun run build:ext && bun run build:web && cp ./src/webview/index.html ./dist/webview/index.html && cp ./src/webview/styles.css ./dist/webview/styles.css",
+    "watch:ext": "bun build ./src/extension.ts --outdir ./dist --target node --external vscode --format cjs --watch",
+    "watch:web": "bun build ./src/webview/main.ts --outdir ./dist/webview --target browser --format iife --watch",
+    "vscode:prepublish": "bun run build"
+  },
+  "devDependencies": {
+    "@types/markdown-it": "14",
+    "@types/node": "catalog:",
+    "@types/vscode": "1.85.0",
+    "typescript": "catalog:"
+  },
+  "dependencies": {
+    "highlight.js": "11",
+    "markdown-it": "14",
+    "markdown-it-task-lists": "2"
+  }
+}
