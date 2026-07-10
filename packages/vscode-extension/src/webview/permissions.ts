@@ -1,20 +1,24 @@
-// Permission modal + queue.
+// Inline permission cards.
 //
 // The opencode server sends a `permission.asked` SSE event whenever a tool
 // wants to do something the user might want to gate (bash, write, edit,
 // webfetch, …). We route each ask through this module, which either
-// silently auto-approves it (read-only classes) or queues it for the modal.
+// silently auto-approves it (read-only classes) or renders an inline card
+// at the bottom of the message list — same UX as the `question` tool, no
+// modal covering the chat.
 //
 // Two entry points:
 //   • `handlePermissionAsk` — called from the SSE branch AND rehydrate.
 //   • `rehydratePermissions` — polls /permission after bootstrap / session
 //      switch to catch anything that fired before the webview subscribed.
 //
-// The module owns its own queue + responded-set + modal DOM references.
-// External code only needs to call `initPermissions` once and forward SSE
-// events; `respondPermission("reject")` is exposed for the Escape key.
+// Previously this was a queue + full-screen modal; users complained the
+// modal hijacked focus and hid the chat behind it. Now every pending ask
+// is a card pinned above the composer, ordered by arrival — the user can
+// scan them, approve/deny in whatever order they like, and keep typing.
 
 import type { OpencodeClient } from "./sdk"
+import { refs } from "./shared"
 
 export type PermissionAsk = {
   id: string
@@ -27,10 +31,6 @@ export type PermissionAsk = {
 }
 
 type Deps = {
-  modal: HTMLElement
-  titleEl: HTMLElement
-  summaryEl: HTMLElement
-  detailEl: HTMLElement
   getClient: () => OpencodeClient | undefined
   getCurrentSessionID: () => string | undefined
   setStatus: (text: string) => void
@@ -39,21 +39,27 @@ type Deps = {
 
 let deps: Deps | null = null
 
-// Queued permission asks we've decided the user should confirm (git/rm/etc).
-// Anything not queued has already been auto-approved via respondPermission.
+// Pending asks the user still needs to confirm. Rendered as cards in
+// arrival order. Auto-approved asks never touch this list.
 const pendingPermissions: PermissionAsk[] = []
 const respondedPermissions = new Set<string>()
 
-export function initPermissions(d: Deps) {
-  deps = d
-  document.getElementById("permission-deny")?.addEventListener("click", () => void respondPermission("reject"))
-  document.getElementById("permission-once")?.addEventListener("click", () => void respondPermission("once"))
-  document.getElementById("permission-always")?.addEventListener("click", () => void respondPermission("always"))
+// scrollToBottom is injected by main.ts (via messages-view) so we can pull
+// a fresh card into view without hard-depending on messages-view here.
+let scrollToBottom: () => void = () => {}
+
+export function initPermissions(d: Deps & { scrollToBottom?: () => void }) {
+  deps = { getClient: d.getClient, getCurrentSessionID: d.getCurrentSessionID, setStatus: d.setStatus, log: d.log }
+  if (d.scrollToBottom) scrollToBottom = d.scrollToBottom
 }
 
-/** True when the modal is currently on screen. */
+/** True when at least one permission card is currently on screen. */
 export function isPermissionModalOpen(): boolean {
-  return !!deps && !deps.modal.hidden
+  // Kept under the old name so main.ts's Escape handler doesn't need to
+  // change signature. Semantically it's now "are there pending inline
+  // permission cards" — Escape still does the right thing (rejects the
+  // oldest one).
+  return pendingPermissions.length > 0
 }
 
 /**
@@ -73,11 +79,10 @@ export function handlePermissionAsk(info: PermissionAsk) {
   // Skip re-processing if we already have this ask queued or already responded.
   if (respondedPermissions.has(info.id)) return
   if (pendingPermissions.some((p) => p.id === info.id)) return
-  if (deps.modal.dataset.currentId === info.id) return
   deps.log("permission.asked", { id: info.id, permission: info.permission, tool: info.tool, patterns: info.patterns, metadata: info.metadata })
   if (needsUserConfirmation(info)) {
     pendingPermissions.push({ ...info, sessionID })
-    if (deps.modal.hidden) showNextPermission()
+    renderPermissions()
     return
   }
   void autoApprove(sessionID, info.id)
@@ -110,32 +115,93 @@ export async function rehydratePermissions() {
 }
 
 /**
- * SSE handler for `permission.replied` / `permission.rejected`. Removes the
- * matching ask from the queue and, if it's the one currently on screen,
- * advances to the next pending ask (or closes the modal if none).
+ * SSE handler for `permission.replied` / `permission.rejected`. Drops the
+ * matching ask from the queue and rerenders. Safe to call for asks we
+ * never queued (e.g. auto-approved ones).
  */
 export function handlePermissionResolved(id: string) {
-  if (!deps) return
   const idx = pendingPermissions.findIndex((p) => p.id === id)
-  if (idx >= 0) pendingPermissions.splice(idx, 1)
-  if (deps.modal.dataset.currentId === id) {
-    hidePermission()
-    showNextPermission()
-  }
+  if (idx < 0) return
+  pendingPermissions.splice(idx, 1)
+  renderPermissions()
 }
 
 /**
- * Respond to the current front-of-queue ask. Escape key handler in main.ts
- * calls this with "reject" so it's exported.
+ * Reject the oldest pending ask. Called by Escape key handler in main.ts.
+ * If no cards are pending, does nothing.
  */
 export async function respondPermission(response: "once" | "always" | "reject") {
   if (!deps) return
   const current = pendingPermissions.shift()
-  hidePermission()
-  showNextPermission()
+  renderPermissions()
   if (!current) return
   deps.log("respondPermission", { id: current.id, response, hasClient: !!deps.getClient() })
   await sendPermissionResponse(current.sessionID, current.id, response)
+}
+
+// Full rerender of pending permission cards. Cheap because the list is tiny
+// (usually 0-1 asks, occasionally 2-3). Cards live in the messages list so
+// they scroll with the chat and stay near the composer.
+export function renderPermissions() {
+  for (const el of Array.from(refs.messages.querySelectorAll(".permission-card"))) el.remove()
+  for (const ask of pendingPermissions) {
+    refs.messages.appendChild(renderPermissionCard(ask))
+  }
+  if (pendingPermissions.length > 0) scrollToBottom()
+}
+
+function renderPermissionCard(info: PermissionAsk): HTMLElement {
+  const view = describePermission(info)
+  const card = document.createElement("div")
+  card.className = "permission-card"
+  card.dataset.permissionId = info.id
+
+  const header = document.createElement("div")
+  header.className = "permission-header"
+  header.textContent = view.title
+  card.appendChild(header)
+
+  const summary = document.createElement("div")
+  summary.className = "permission-summary"
+  summary.textContent = view.summary
+  card.appendChild(summary)
+
+  if (view.detail) {
+    const detail = document.createElement("pre")
+    detail.className = "permission-detail"
+    detail.textContent = view.detail
+    card.appendChild(detail)
+  }
+
+  const actions = document.createElement("div")
+  actions.className = "permission-actions"
+  const denyBtn = document.createElement("button")
+  denyBtn.className = "question-btn secondary"
+  denyBtn.textContent = "Deny"
+  const onceBtn = document.createElement("button")
+  onceBtn.className = "question-btn primary"
+  onceBtn.textContent = "Allow once"
+  const alwaysBtn = document.createElement("button")
+  alwaysBtn.className = "question-btn primary"
+  alwaysBtn.textContent = "Always allow"
+
+  const answer = async (response: "reject" | "once" | "always") => {
+    denyBtn.disabled = onceBtn.disabled = alwaysBtn.disabled = true
+    const idx = pendingPermissions.findIndex((p) => p.id === info.id)
+    if (idx >= 0) pendingPermissions.splice(idx, 1)
+    renderPermissions()
+    await sendPermissionResponse(info.sessionID, info.id, response)
+  }
+  denyBtn.addEventListener("click", () => void answer("reject"))
+  onceBtn.addEventListener("click", () => void answer("once"))
+  alwaysBtn.addEventListener("click", () => void answer("always"))
+
+  actions.appendChild(denyBtn)
+  actions.appendChild(onceBtn)
+  actions.appendChild(alwaysBtn)
+  card.appendChild(actions)
+
+  return card
 }
 
 // Decide whether a permission request should interrupt the user.
@@ -144,20 +210,13 @@ export async function respondPermission(response: "once" | "always" | "reject") 
 // user's machine and they deserve to see exactly what. We only auto-approve
 // permission classes that are provably read-only (glob/grep/read/list_dir/
 // webfetch info retrieval): those pop up dozens of times per turn and would
-// bury the user in modals for no safety gain.
-//
-// Previous heuristic (only ask for `bash` + destructive command) was wrong:
-// it silently rubber-stamped `write`/`edit`/`patch` and hid what the model
-// was doing. Confirmed to be the direct cause of the "stuck on write pending"
-// reports — the auto-approve POST would race the tool call and if the reply
-// endpoint changed schema (as it did between server versions) the ask would
-// never get answered.
+// bury the user in cards for no safety gain.
 function needsUserConfirmation(info: PermissionAsk): boolean {
   return !isReadOnlyPermission(info.permission)
 }
 
 // Permission classes considered safe enough to auto-approve. Everything not
-// on this list falls through to a modal — better a friction-y prompt than a
+// on this list falls through to a card — better a friction-y prompt than a
 // silent write.
 function isReadOnlyPermission(perm: string): boolean {
   switch (perm) {
@@ -176,30 +235,8 @@ function isReadOnlyPermission(perm: string): boolean {
   }
 }
 
-function showNextPermission() {
-  if (!deps) return
-  const next = pendingPermissions[0]
-  if (!next) {
-    hidePermission()
-    return
-  }
-  const view = describePermission(next)
-  deps.titleEl.textContent = view.title
-  deps.summaryEl.textContent = view.summary
-  deps.detailEl.textContent = view.detail
-  deps.detailEl.hidden = view.detail.length === 0
-  deps.modal.dataset.currentId = next.id
-  deps.modal.hidden = false
-}
-
-function hidePermission() {
-  if (!deps) return
-  deps.modal.hidden = true
-  delete deps.modal.dataset.currentId
-}
-
 // Turn a raw permission request into "title / summary / detail" strings for
-// the modal. Different permission kinds carry different useful payload —
+// the card. Different permission kinds carry different useful payload —
 // bash has metadata.command, write/edit have metadata.filePath + content,
 // webfetch has metadata.url, etc. When we don't recognise the kind we just
 // dump the metadata as JSON so nothing surprising gets hidden.
@@ -251,7 +288,7 @@ function describePermission(info: PermissionAsk): { title: string; summary: stri
   }
 }
 
-// Trim long payloads so the modal stays scannable; users can still read the
+// Trim long payloads so the card stays scannable; users can still read the
 // full picture in the Output channel where we log the raw ask.
 function clipText(text: string, max: number): string {
   if (text.length <= max) return text

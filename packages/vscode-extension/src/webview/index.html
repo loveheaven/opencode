@@ -43,18 +43,10 @@
       </div>
       <img id="lightbox-image" class="lightbox-image" alt="" />
     </div>
-    <div id="permission-modal" hidden>
-      <div class="modal-body">
-        <h3 id="permission-title">Confirm</h3>
-        <div id="permission-summary" class="permission-summary"></div>
-        <pre id="permission-detail"></pre>
-        <div class="modal-actions">
-          <button id="permission-deny" class="secondary">Deny</button>
-          <button id="permission-once" class="primary">Allow once</button>
-          <button id="permission-always" class="primary">Always allow</button>
-        </div>
-      </div>
-    </div>
+    <!-- Permission asks used to render as a modal here; they're now inline
+         cards pinned to the bottom of the message list (see permissions.ts,
+         renderPermissionCard). Kept the ID-space free in case a future
+         upgrade wants to reintroduce a modal for a specific permission kind. -->
     <!-- Settings overlay: opened via `showSettings` message. Renders on
          top of the chat panel so chat state stays intact underneath. -->
     <div id="settings-overlay" hidden>
