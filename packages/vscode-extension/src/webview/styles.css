@@ -474,9 +474,10 @@ body.opencode-dragging * {
 }
 
 /*
- * Image lightbox: full-panel overlay above the sessions drawer, permission
- * modal, etc. Uses z-index above 60 (used by #permission-modal) so it can
- * pop over everything else in the chat panel.
+ * Image lightbox: full-panel overlay above the sessions drawer and settings
+ * overlay. Uses a high z-index so it pops over everything else in the chat
+ * panel (permission cards are now inline in the message list, no modal to
+ * worry about layering against).
  */
 .image-lightbox {
   position: absolute;
@@ -1138,40 +1139,30 @@ button.ghost:hover { background: var(--vscode-toolbar-hoverBackground); }
   word-break: break-all;
 }
 
-#permission-modal {
-  position: absolute;
-  inset: 0;
-  background: color-mix(in srgb, var(--vscode-editor-background) 80%, transparent);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 60;
-}
-.modal-body {
-  background: var(--vscode-editor-background);
+/* Permission card
+ *
+ * Rendered inline at the bottom of the message list when a tool asks for
+ * consent (bash / write / edit / webfetch etc.). Shares the question card's
+ * layout but uses a warning-toned left border because this is a security
+ * boundary — user must acknowledge before the tool proceeds.
+ */
+.permission-card {
+  margin: 12px 8px;
+  padding: 12px 12px 10px;
   border: 1px solid var(--vscode-panel-border, transparent);
+  border-left: 3px solid var(--vscode-editorWarning-foreground, var(--vscode-notificationsWarningIcon-foreground, #cca700));
   border-radius: 6px;
-  padding: 14px;
-  min-width: 260px;
-  max-width: 90%;
-  max-height: 80%;
-  overflow: auto;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
-.modal-body h3 { margin: 0; font-size: 14px; }
-.modal-body pre {
-  background: var(--vscode-textCodeBlock-background, transparent);
-  padding: 6px 8px;
-  border-radius: 3px;
-  max-height: 200px;
-  overflow: auto;
-  font-family: var(--vscode-editor-font-family, monospace);
+.permission-header {
   font-size: 12px;
-  white-space: pre-wrap;
+  font-weight: 600;
+  color: var(--vscode-editorWarning-foreground, var(--vscode-foreground));
+  letter-spacing: 0.02em;
 }
-.modal-actions { display: flex; justify-content: flex-end; gap: 6px; }
 .permission-summary {
   font-family: var(--vscode-editor-font-family, monospace);
   font-size: 12px;
@@ -1180,10 +1171,27 @@ button.ghost:hover { background: var(--vscode-toolbar-hoverBackground); }
   background: var(--vscode-textCodeBlock-background, transparent);
   white-space: pre-wrap;
   word-wrap: break-word;
-  /* Write/edit summaries include a preview of the content being written —
-   * cap the height so the modal stays scrollable and buttons remain reachable. */
+  /* Write/edit summaries include a preview of the file content being
+   * written — cap so the card stays scannable and buttons stay reachable. */
   max-height: 40vh;
   overflow: auto;
+}
+.permission-detail {
+  background: var(--vscode-textCodeBlock-background, transparent);
+  padding: 6px 8px;
+  border-radius: 3px;
+  max-height: 200px;
+  overflow: auto;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  white-space: pre-wrap;
+  margin: 0;
+  opacity: 0.85;
+}
+.permission-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 /* Empty state */

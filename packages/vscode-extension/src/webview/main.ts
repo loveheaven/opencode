@@ -142,14 +142,11 @@ function setup() {
     setBusy,
   })
   initPermissions({
-    modal: $("permission-modal"),
-    titleEl: $("permission-title"),
-    summaryEl: $("permission-summary"),
-    detailEl: $("permission-detail"),
     getClient,
     getCurrentSessionID: () => state.sessionID,
     setStatus,
     log,
+    scrollToBottom,
   })
   initSettings({
     overlay: document.getElementById("settings-overlay"),
