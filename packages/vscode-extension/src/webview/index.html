@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="__CSP__" />
+  <link rel="stylesheet" href="__STYLE__" />
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <div id="session-label">Loading…</div>
+      <div class="spacer"></div>
+      <span id="session-usage" class="token-badge" hidden></span>
+    </header>
+    <main id="messages" tabindex="0"></main>
+    <!-- Horizontal drag handle between messages and composer. Users drag it
+         up/down to reshape the split; textarea alone can only grow itself. -->
+    <div id="composer-resizer" role="separator" aria-orientation="horizontal" title="Drag to resize"></div>
+    <footer id="composer">
+      <div id="attachments-strip" class="attachments-strip" hidden></div>
+      <textarea id="input" rows="3" placeholder="Ask opencode… (Cmd/Ctrl+Enter to send · paste or drop images · type / for commands)"></textarea>
+      <div id="composer-actions">
+        <div id="agent-model" class="pill-row"></div>
+        <div class="spacer"></div>
+        <button id="stop-btn" class="secondary" hidden>Stop</button>
+        <button id="send-btn" class="primary">Send</button>
+      </div>
+      <div id="status-row"><span id="status-text"></span></div>
+    </footer>
+    <aside id="sessions-drawer" hidden>
+      <div class="drawer-header">
+        <strong>Sessions</strong>
+        <button id="sessions-close" class="ghost" aria-label="Close">✕</button>
+      </div>
+      <div id="sessions-list"></div>
+    </aside>
+    <div id="image-lightbox" class="image-lightbox" hidden>
+      <button id="lightbox-close" class="lightbox-btn lightbox-close" aria-label="Close">✕</button>
+      <div id="lightbox-toolbar" class="lightbox-toolbar">
+        <button id="lightbox-zoom-out" class="lightbox-btn" aria-label="Zoom out" title="Zoom out">−</button>
+        <button id="lightbox-zoom-reset" class="lightbox-btn" aria-label="Reset zoom" title="Reset zoom">1:1</button>
+        <button id="lightbox-zoom-in" class="lightbox-btn" aria-label="Zoom in" title="Zoom in">+</button>
+      </div>
+      <img id="lightbox-image" class="lightbox-image" alt="" />
+    </div>
+    <div id="permission-modal" hidden>
+      <div class="modal-body">
+        <h3 id="permission-title">Confirm</h3>
+        <div id="permission-summary" class="permission-summary"></div>
+        <pre id="permission-detail"></pre>
+        <div class="modal-actions">
+          <button id="permission-deny" class="secondary">Deny</button>
+          <button id="permission-once" class="primary">Allow once</button>
+          <button id="permission-always" class="primary">Always allow</button>
+        </div>
+      </div>
+    </div>
+    <!-- Settings overlay: opened via `showSettings` message. Renders on
+         top of the chat panel so chat state stays intact underneath. -->
+    <div id="settings-overlay" hidden>
+      <header id="settings-tabs">
+        <button class="settings-tab" data-tab="providers">Providers</button>
+        <button class="settings-tab" data-tab="mcp">MCP</button>
+        <button class="settings-tab" data-tab="skills">Skills</button>
+        <button class="settings-tab" data-tab="plugins">Plugins</button>
+        <div class="spacer"></div>
+        <button id="settings-close" class="ghost" title="Close settings" aria-label="Close settings">✕</button>
+      </header>
+      <div id="settings-body"></div>
+    </div>
+  </div>
+  <script nonce="__NONCE__" src="__SCRIPT__"></script>
+</body>
+</html>
