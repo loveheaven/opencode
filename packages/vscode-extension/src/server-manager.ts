@@ -297,7 +297,28 @@ function findRepoRoot(output?: vscode.OutputChannel): string | undefined {
   if (configured) seeds.push(configured)
 
   const folders = vscode.workspace.workspaceFolders
-  if (folders) for (const f of folders) seeds.push(f.uri.fsPath)
+  if (folders) {
+    for (const f of folders) {
+      seeds.push(f.uri.fsPath)
+      // Additionally seed each immediate child directory. This lets us find
+      // an opencode source checkout when the user has opened a *parent* of
+      // the checkout as their VSCode workspace — a common layout is
+      // `~/projects` opened at the top level with `~/projects/opencode`
+      // (or similar) inside. Without this, findRepoRoot would only walk
+      // upward from the workspace folder and miss the checkout entirely,
+      // and with no CLI on PATH the extension falls back to "server is
+      // not ready" instead of spawning via bun-source. Silent on
+      // EACCES/ENOENT because permission-denied on a top-level workspace
+      // is common and shouldn't spam the log.
+      try {
+        for (const entry of fs.readdirSync(f.uri.fsPath, { withFileTypes: true })) {
+          if (entry.isDirectory()) seeds.push(path.join(f.uri.fsPath, entry.name))
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
 
   const activeUri = vscode.window.activeTextEditor?.document?.uri
   if (activeUri && activeUri.scheme === "file") seeds.push(path.dirname(activeUri.fsPath))
@@ -411,7 +432,12 @@ function waitForReady(url: string, timeoutMs: number): Promise<boolean> {
   const start = Date.now()
   return new Promise((resolve) => {
     const attempt = () => {
-      probeOnce(url).then((ok) => {
+      // Short per-attempt budget during spawn readiness polling — the server
+      // is local, so anything slower than ~800ms per probe means it's not
+      // actually up yet and we should keep looping until timeoutMs runs out.
+      // Distinct from probeOnce's default (3s) which is used for external
+      // attach where the far side may be behind a proxy/tunnel.
+      probeOnce(url, 800).then((ok) => {
         if (ok) return resolve(true)
         if (Date.now() - start > timeoutMs) return resolve(false)
         setTimeout(attempt, 300)
@@ -421,7 +447,21 @@ function waitForReady(url: string, timeoutMs: number): Promise<boolean> {
   })
 }
 
-function probeOnce(url: string): Promise<boolean> {
+// Exported so extension.ts can reuse this on the external-mode fast-path
+// (attach if the configured URL responds, otherwise fall back to spawn).
+// The check is intentionally lenient: any HTTP status < 500 counts as
+// "someone is listening", because opencode's root path may 404 for
+// unauthenticated GETs but the port is clearly held.
+//
+// The internal waitForReady() loop calls this repeatedly with a short per-
+// attempt budget so an unresponsive port fails quickly during startup.
+// The external-mode fast-path in extension.ts only calls probeOnce once,
+// so it needs to be lenient enough that a real (but slower) server on the
+// far side isn't misclassified as "gone" — e.g. an opencode server sitting
+// behind mitmproxy / a Cloudflare tunnel can easily take >1s to complete
+// the first GET / round-trip. Default is picked to be comfortably above
+// that while still failing fast when nothing is listening.
+export function probeOnce(url: string, timeoutMs = 3000): Promise<boolean> {
   return new Promise((resolve) => {
     let parsed: URL
     try {
@@ -436,7 +476,7 @@ function probeOnce(url: string): Promise<boolean> {
         hostname: parsed.hostname,
         port: parsed.port || 80,
         path: "/",
-        timeout: 800,
+        timeout: timeoutMs,
       },
       (res) => {
         res.resume()

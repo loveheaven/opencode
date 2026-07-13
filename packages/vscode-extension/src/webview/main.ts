@@ -10,10 +10,11 @@
 
 import {
   OpencodeClient,
-  makeMessageID,
   type HostBridge,
 } from "./sdk"
 import {
+  applyDebugState,
+  applyServerConfig,
   closeSettings,
   initSettings,
   isSettingsOpen,
@@ -296,6 +297,16 @@ async function onExtensionMessage(event: MessageEvent) {
       cb(msg.value as string | undefined)
       return
     }
+    case "debugState":
+      applyDebugState(Boolean(msg.enabled))
+      return
+    case "serverConfig": {
+      const mode = (msg.mode as string) === "external" ? "external" : "spawn"
+      const url = typeof msg.url === "string" ? (msg.url as string) : "http://127.0.0.1:4096"
+      const spawnUrl = typeof msg.spawnUrl === "string" ? (msg.spawnUrl as string) : undefined
+      applyServerConfig(mode, url, spawnUrl)
+      return
+    }
   }
 }
 
@@ -464,7 +475,14 @@ async function sendPrompt() {
   if (!text && attachments.length === 0) return
   if (state.busy) return
 
-  const messageID = makeMessageID()
+  // Intentionally do NOT pre-generate a messageID here. The opencode server
+  // mints message ids that embed a monotonically-increasing hex timestamp
+  // prefix, and the prompt loop (packages/opencode/src/session/prompt.ts)
+  // compares `lastUser.id < lastAssistant.id` lexicographically to decide
+  // when a turn is "done". If the webview supplies its own id in a
+  // different encoding, that comparison can flip and the loop will keep
+  // re-invoking the model with the same history forever. Letting the
+  // server assign the id keeps both sides in the same id-space.
   const model = state.model.includes("/")
     ? { providerID: state.model.split("/")[0], modelID: state.model.split("/").slice(1).join("/") }
     : undefined
@@ -490,14 +508,12 @@ async function sendPrompt() {
         sessionID: state.sessionID,
         command: commandName as string,
         arguments: commandArgs,
-        messageID,
         agent: state.agent || undefined,
         model: state.model || undefined,
       })
     } else {
       await client.promptAsync({
         sessionID: state.sessionID,
-        messageID,
         text,
         attachments: attachments.map((a) => ({ mime: a.mime, url: a.url, filename: a.filename })),
         agent: state.agent || undefined,

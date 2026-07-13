@@ -3,11 +3,21 @@ import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import * as http from "node:http"
 import { URL } from "node:url"
-import { ServerManager, type ServerStatus } from "./server-manager"
+import { ServerManager, probeOnce, type ServerStatus } from "./server-manager"
 import type { AttachmentPayload, BootstrapMessage, ExtensionMessage, WebviewRequest } from "./api"
 import { pathToFileURL } from "node:url"
 
 const VIEW_ID = "opencode.chat"
+// Key used to persist the debug logging flag across sessions via
+// context.globalState. When true, proxyHttp / proxySseOpen dump the full
+// request and response payloads (headers + body) to the OpenCode output
+// channel so users can inspect what the webview and the opencode server
+// are actually exchanging.
+const DEBUG_LOG_KEY = "opencode.debugLog"
+// Cap for logged bodies. Prompt/streaming responses can be many megabytes;
+// truncating keeps the output panel responsive while still surfacing enough
+// to reproduce most bugs.
+const DEBUG_MAX_BODY_LEN = 32 * 1024
 
 let provider: OpencodeViewProvider | undefined
 let serverManager: ServerManager | undefined
@@ -118,6 +128,31 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
     private readonly output: vscode.OutputChannel,
   ) {}
 
+  // ---- Debug logging ----------------------------------------------------
+  //
+  // The extension host is the only place that can see the raw HTTP traffic
+  // between the webview and the opencode server (the webview's fetch calls
+  // are proxied through proxyHttp / proxySseOpen). When the user flips the
+  // Debug toggle in the Settings tab, we start writing full request lines,
+  // headers, and response bodies to the OpenCode output channel.
+
+  private isDebugEnabled(): boolean {
+    return this.context.globalState.get<boolean>(DEBUG_LOG_KEY, false) === true
+  }
+
+  private async setDebugEnabled(enabled: boolean) {
+    await this.context.globalState.update(DEBUG_LOG_KEY, enabled)
+    if (enabled) this.output.appendLine(`[opencode-ext] debug logging ENABLED at ${new Date().toISOString()}`)
+    else this.output.appendLine(`[opencode-ext] debug logging disabled at ${new Date().toISOString()}`)
+    // Confirm to the webview so the toggle reflects the persisted state.
+    this.view?.webview.postMessage({ type: "debugState", enabled })
+  }
+
+  private debugLog(lines: readonly string[]) {
+    if (!this.isDebugEnabled()) return
+    for (const line of lines) this.output.appendLine(line)
+  }
+
   onServerStatus(status: ServerStatus): void {
     if (!this.view) return
     if (status.state === "ready") {
@@ -154,12 +189,7 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
 
     // Resolve server URL BEFORE building HTML so CSP connect-src includes the loopback origin.
     // Without this, the meta CSP tag is baked with empty connect-src and every fetch/SSE is blocked.
-    if (getServerMode() === "spawn") {
-      const status = await this.server.ensureRunning()
-      if (status.state === "ready") this.lastServerUrl = status.url
-    } else {
-      this.lastServerUrl = getExternalUrl()
-    }
+    this.lastServerUrl = await this.resolveServerUrlWithFallback()
 
     webviewView.webview.html = await this.buildHtml(webviewView.webview)
     void this.sendBootstrap()
@@ -167,18 +197,58 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
 
   async reload(): Promise<void> {
     if (!this.view) return
-    if (getServerMode() === "spawn") {
-      const status = this.server.getStatus()
-      if (status.state === "ready") this.lastServerUrl = status.url
-      else {
-        const started = await this.server.ensureRunning()
-        if (started.state === "ready") this.lastServerUrl = started.url
-      }
-    } else {
-      this.lastServerUrl = getExternalUrl()
-    }
+    this.lastServerUrl = await this.resolveServerUrlWithFallback({ preferCachedSpawn: true })
     this.view.webview.html = await this.buildHtml(this.view.webview)
     void this.sendBootstrap()
+  }
+
+  // Central "which URL should the webview talk to?" decision. Called from
+  // resolveWebviewView() and reload() so both paths behave identically.
+  //
+  // Policy (per user request):
+  //   • serverMode === "spawn"     → spawn (or reuse) a local server.
+  //   • serverMode === "external"  → probe the configured URL with a short
+  //                                   timeout. If it answers, attach. If it
+  //                                   doesn't, fall back to spawn so the user
+  //                                   isn't left staring at a "Server not
+  //                                   ready" panel just because their
+  //                                   external server isn't running yet.
+  //
+  // Any fallback is logged so it's visible in the OpenCode output channel.
+  // We deliberately do NOT rewrite `opencode.serverMode` to "spawn" on
+  // fallback — the user's intent (attach when possible) is preserved, and
+  // next reload will retry the external URL first.
+  private async resolveServerUrlWithFallback(opts?: { preferCachedSpawn?: boolean }): Promise<string | undefined> {
+    if (getServerMode() === "spawn") {
+      // Reuse a live server when we can — reload() should never gratuitously
+      // restart the child just because the user tweaked an unrelated setting.
+      if (opts?.preferCachedSpawn) {
+        const cached = this.server.getStatus()
+        if (cached.state === "ready") return cached.url
+      }
+      const status = await this.server.ensureRunning()
+      return status.state === "ready" ? status.url : undefined
+    }
+
+    // external
+    const externalUrl = getExternalUrl()
+    this.output.appendLine(`[opencode-ext] external mode: probing ${externalUrl}`)
+    const alive = await probeOnce(externalUrl)
+    if (alive) {
+      this.output.appendLine(`[opencode-ext] external server reachable — attaching to ${externalUrl}`)
+      return externalUrl
+    }
+    this.output.appendLine(
+      `[opencode-ext] external server ${externalUrl} did not respond within probe timeout; falling back to spawn`,
+    )
+    const status = await this.server.ensureRunning()
+    if (status.state === "ready") {
+      vscode.window.showInformationMessage(
+        `OpenCode: could not reach ${externalUrl}, spawned a local server instead.`,
+      )
+      return status.url
+    }
+    return undefined
   }
 
   // Public entry so extension commands can jump straight into the config
@@ -190,7 +260,7 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
   // Open the settings overlay inside the chat webview. `tab` selects the
   // initial tab (mcp / skills / plugins). Reveals the chat view first so
   // the overlay lands on top of a visible panel.
-  async showSettings(tab: "mcp" | "skills" | "plugins"): Promise<void> {
+  async showSettings(tab: "mcp" | "skills" | "plugins" | "settings"): Promise<void> {
     await revealView()
     // Ensure server is up so the panel's fetches work; also lets the
     // webview receive the bootstrap before we ask it to render settings.
@@ -390,6 +460,86 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
       case "sseClose":
         this.proxySseClose((msg as Extract<WebviewRequest, { type: "sseClose" }>).id)
         return
+      case "getDebug":
+        this.view?.webview.postMessage({ type: "debugState", enabled: this.isDebugEnabled() })
+        return
+      case "setDebug":
+        void this.setDebugEnabled(Boolean((msg as Extract<WebviewRequest, { type: "setDebug" }>).enabled))
+        return
+      case "openDebugLog":
+        this.output.show(true)
+        return
+      case "getServerConfig": {
+        this.postServerConfig()
+        return
+      }
+      case "applyServerConfig": {
+        const req = msg as Extract<WebviewRequest, { type: "applyServerConfig" }>
+        void this.handleApplyServerConfig(req.mode, req.url)
+        return
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // External-server settings ("Settings → Server connection")
+  // -------------------------------------------------------------------
+  //
+  // Replaces an earlier auto-scan implementation that turned out unreliable
+  // (webview↔host messages were racing with the reload cycle when the user
+  // clicked the button on a stale panel). The current design is dumber and
+  // more predictable: the user types a hostname + port, we validate, we
+  // write serverMode/serverUrl. `onDidChangeConfiguration("opencode")` in
+  // activate() picks up the write and triggers reload(), so the panel
+  // rebinds to the new URL automatically.
+
+  private postServerConfig() {
+    const cfg = getConfig()
+    const mode = (cfg.get<string>("serverMode") ?? "spawn") as "spawn" | "external"
+    const url = cfg.get<string>("serverUrl") ?? "http://127.0.0.1:4096"
+    // Include the currently-spawned server URL when we have one. In spawn
+    // mode the actual bound port is derived at start-time (see ServerManager
+    // → preferredPort() → pickPort()) so it usually differs from the
+    // persisted `opencode.serverUrl`. The webview form prefills its
+    // hostname/port inputs from spawnUrl when available so "Attach to
+    // external server" targets the process this extension actually spawned,
+    // rather than the stale default the user last saved for external mode.
+    const spawnStatus = this.server.getStatus()
+    const spawnUrl =
+      spawnStatus.state === "ready" || spawnStatus.state === "starting"
+        ? spawnStatus.url
+        : this.lastServerUrl && mode === "spawn"
+          ? this.lastServerUrl
+          : undefined
+    this.view?.webview.postMessage({
+      type: "serverConfig",
+      mode,
+      url,
+      spawnUrl,
+    } satisfies ExtensionMessage)
+  }
+
+  private async handleApplyServerConfig(mode: "spawn" | "external", url: string | undefined) {
+    const cfg = getConfig()
+    try {
+      if (mode === "external") {
+        const clean = (url ?? "").trim().replace(/\/+$/, "")
+        if (!/^https?:\/\/[^\s]+:\d+$/.test(clean) && !/^https?:\/\/[^\s/:]+$/.test(clean)) {
+          vscode.window.showErrorMessage(`OpenCode: invalid server URL "${url}"`)
+          return
+        }
+        await cfg.update("serverMode", "external", vscode.ConfigurationTarget.Global)
+        await cfg.update("serverUrl", clean, vscode.ConfigurationTarget.Global)
+        this.output.appendLine(`[opencode-ext] switched to external server ${clean}`)
+        vscode.window.showInformationMessage(`OpenCode: attached to ${clean}`)
+      } else {
+        await cfg.update("serverMode", "spawn", vscode.ConfigurationTarget.Global)
+        this.output.appendLine(`[opencode-ext] switched to spawn mode`)
+        vscode.window.showInformationMessage(`OpenCode: reverted to spawn mode`)
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      vscode.window.showErrorMessage(`OpenCode: failed to update settings — ${message}`)
     }
   }
 
@@ -403,6 +553,16 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
       view.webview.postMessage({ type: "httpError", id: msg.id, message: `bad url: ${(err as Error).message}` })
       return
     }
+    // Debug is read at every log point (not captured once) so toggling the
+    // flag mid-request still records the response. This matters because SSE
+    // streams live for the whole session — capturing a boolean at open time
+    // would silently drop every subsequent event.
+    const started = Date.now()
+    this.debugLog([
+      `\n[opencode-debug] >>> HTTP ${msg.id} ${msg.method} ${msg.url}`,
+      `[opencode-debug]  headers: ${JSON.stringify(msg.headers ?? {})}`,
+      `[opencode-debug]  body: ${truncateForLog(msg.body)}`,
+    ])
     const req = http.request(
       {
         method: msg.method,
@@ -422,6 +582,11 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
             else if (Array.isArray(v)) headers[k] = v.join(",")
           }
           const status = res.statusCode ?? 0
+          this.debugLog([
+            `[opencode-debug] <<< HTTP ${msg.id} ${status} ${res.statusMessage ?? ""} (+${Date.now() - started}ms)`,
+            `[opencode-debug]  headers: ${JSON.stringify(headers)}`,
+            `[opencode-debug]  body: ${truncateForLog(body)}`,
+          ])
           view.webview.postMessage({
             type: "httpResponse",
             id: msg.id,
@@ -435,6 +600,7 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
       },
     )
     req.on("error", (err) => {
+      this.debugLog([`[opencode-debug] !!! HTTP ${msg.id} error: ${err.message}`])
       view.webview.postMessage({ type: "httpError", id: msg.id, message: err.message })
     })
     if (msg.body) req.write(msg.body)
@@ -453,6 +619,16 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
       view.webview.postMessage({ type: "sseError", id: msg.id, message: `bad url: ${(err as Error).message}` })
       return
     }
+    // Read the flag at every log call (not once) — the SSE stream lives for
+    // the entire session, so a snapshot taken at open time would freeze the
+    // "off" state and drop every subsequent event once the user toggled
+    // debug on. This is why users see the outbound prompt (fresh HTTP call
+    // after toggle) but not the response frames (SSE opened at bootstrap,
+    // before the toggle).
+    this.debugLog([
+      `\n[opencode-debug] >>> SSE ${msg.id} OPEN ${msg.url}`,
+      `[opencode-debug]  headers: ${JSON.stringify({ accept: "text/event-stream", ...(msg.headers ?? {}) })}`,
+    ])
     const req = http.request(
       {
         method: "GET",
@@ -463,11 +639,21 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
       },
       (res) => {
         if ((res.statusCode ?? 0) >= 400) {
+          this.debugLog([`[opencode-debug] !!! SSE ${msg.id} status ${res.statusCode}`])
           view.webview.postMessage({ type: "sseError", id: msg.id, message: `HTTP ${res.statusCode}` })
           req.destroy()
           this.sseStreams.delete(msg.id)
           return
         }
+        const headers: Record<string, string> = {}
+        for (const [k, v] of Object.entries(res.headers)) {
+          if (typeof v === "string") headers[k] = v
+          else if (Array.isArray(v)) headers[k] = v.join(",")
+        }
+        this.debugLog([
+          `[opencode-debug] <<< SSE ${msg.id} ${res.statusCode ?? 0} ${res.statusMessage ?? ""}`,
+          `[opencode-debug]  headers: ${JSON.stringify(headers)}`,
+        ])
         res.setEncoding("utf8")
         let buffer = ""
         res.on("data", (chunk: string) => {
@@ -480,21 +666,25 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
               if (!line.startsWith("data:")) continue
               const data = line.slice(5).trimStart()
               if (!data) continue
+              this.debugLog([`[opencode-debug]  SSE ${msg.id} event: ${truncateForLog(data)}`])
               view.webview.postMessage({ type: "sseEvent", id: msg.id, data })
             }
           }
         })
         res.on("end", () => {
+          this.debugLog([`[opencode-debug] === SSE ${msg.id} END`])
           view.webview.postMessage({ type: "sseEnd", id: msg.id })
           this.sseStreams.delete(msg.id)
         })
         res.on("error", (err) => {
+          this.debugLog([`[opencode-debug] !!! SSE ${msg.id} error: ${err.message}`])
           view.webview.postMessage({ type: "sseError", id: msg.id, message: err.message })
           this.sseStreams.delete(msg.id)
         })
       },
     )
     req.on("error", (err) => {
+      this.debugLog([`[opencode-debug] !!! SSE ${msg.id} req error: ${err.message}`])
       view.webview.postMessage({ type: "sseError", id: msg.id, message: err.message })
       this.sseStreams.delete(msg.id)
     })
@@ -964,6 +1154,16 @@ function detectIndent(source: string, pos: number): string {
   return match ? match[0] : ""
 }
 
+// Format a body/payload for the debug log. Keeps it inline (single log line)
+// unless it contains newlines already; truncates long payloads so the output
+// panel stays usable during streaming.
+function truncateForLog(body: string | undefined): string {
+  if (body === undefined || body === null) return "(empty)"
+  if (body === "") return "(empty)"
+  if (body.length <= DEBUG_MAX_BODY_LEN) return body
+  return `${body.slice(0, DEBUG_MAX_BODY_LEN)}… [truncated ${body.length - DEBUG_MAX_BODY_LEN} bytes]`
+}
+
 function findFirstBrace(source: string): number {
   let i = 0
   while (i < source.length) {
@@ -1024,3 +1224,4 @@ function findMatchingClose(source: string, openIdx: number): number {
   }
   return -1
 }
+
