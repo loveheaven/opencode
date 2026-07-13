@@ -792,6 +792,40 @@ button.ghost:hover { background: var(--vscode-toolbar-hoverBackground); }
   min-height: 14px;
 }
 
+/* Settings tab (general extension settings, debug toggle, etc.) */
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 2px;
+}
+.settings-heading {
+  font-size: 12px;
+  font-weight: 600;
+  opacity: 0.9;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 2px;
+}
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+.settings-row input[type="checkbox"] { margin: 0; }
+.settings-hint {
+  font-size: 12px;
+  opacity: 0.75;
+  line-height: 1.4;
+}
+.settings-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
 /* MCP tab */
 .mcp-card {
   border: 1px solid var(--vscode-panel-border, transparent);

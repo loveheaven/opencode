@@ -10,7 +10,7 @@
 
 import type { McpStatus, OpencodeClient, ProviderInfo, SkillInfo } from "./sdk"
 
-export type SettingsTab = "mcp" | "skills" | "plugins" | "providers"
+export type SettingsTab = "mcp" | "skills" | "plugins" | "providers" | "settings"
 
 type PostMessage = (msg: unknown) => void
 type StatusSetter = (text: string) => void
@@ -95,6 +95,270 @@ async function switchSettingsTab(tab: SettingsTab) {
   else if (tab === "mcp") await renderMcpTab()
   else if (tab === "skills") await renderSkillsTab()
   else if (tab === "plugins") await renderPluginsTab()
+  else if (tab === "settings") renderSettingsSubTab()
+}
+
+// ---- Settings tab (general extension settings) ----
+//
+// Currently exposes a single option: Debug logging. When enabled, the
+// extension host writes every request/response the webview exchanges with
+// the opencode server (including SSE frames) into the "OpenCode" output
+// channel — useful when a model gets stuck in a loop or a tool call
+// misbehaves and you need to inspect the raw traffic.
+//
+// The flag lives in the extension host (context.globalState); this render
+// only draws the checkbox and asks for the current value via
+// postMessage `getDebug`. The host answers with `debugState { enabled }`,
+// which the webview forwards here via `applyDebugState`.
+
+let debugCheckbox: HTMLInputElement | null = null
+
+export function applyDebugState(enabled: boolean) {
+  if (debugCheckbox) debugCheckbox.checked = enabled
+}
+
+function renderSettingsSubTab() {
+  if (!bodyEl) return
+  const root = bodyEl
+  root.innerHTML = ""
+
+  // ---- Section 1: Server connection --------------------------------
+  root.appendChild(renderServerConnectionSection())
+
+  // ---- Section 2: Debug --------------------------------------------
+  const section = document.createElement("div")
+  section.className = "settings-section"
+
+  const heading = document.createElement("div")
+  heading.className = "settings-heading"
+  heading.textContent = "Debug"
+  section.appendChild(heading)
+
+  const row = document.createElement("label")
+  row.className = "settings-row"
+  const cb = document.createElement("input")
+  cb.type = "checkbox"
+  cb.id = "settings-debug-log"
+  debugCheckbox = cb
+  const label = document.createElement("span")
+  label.textContent = "Log request & response to OpenCode output"
+  row.appendChild(cb)
+  row.appendChild(label)
+  section.appendChild(row)
+
+  const desc = document.createElement("div")
+  desc.className = "settings-hint"
+  desc.textContent =
+    "Writes every HTTP call and SSE frame between this webview and the opencode server (including prompt payloads and streaming events) into the “OpenCode” output channel. Turn on when the model gets stuck or a tool call misbehaves, so you can share the log."
+  section.appendChild(desc)
+
+  const actions = document.createElement("div")
+  actions.className = "settings-actions"
+  const openBtn = document.createElement("button")
+  openBtn.className = "pill"
+  openBtn.textContent = "Open output log"
+  openBtn.addEventListener("click", () => postMessage({ type: "openDebugLog" }))
+  actions.appendChild(openBtn)
+  section.appendChild(actions)
+
+  root.appendChild(section)
+
+  cb.addEventListener("change", () => {
+    postMessage({ type: "setDebug", enabled: cb.checked })
+  })
+
+  // Ask the host for the current value; response arrives via debugState
+  // handled in main.ts, which calls applyDebugState.
+  postMessage({ type: "getDebug" })
+}
+
+// ---- Server connection section ----
+//
+// User story: someone launched `opencode serve --port <n>` in a terminal
+// (typically to inherit HTTPS_PROXY / NODE_EXTRA_CA_CERTS for mitmproxy
+// interception) and wants this VSCode instance to attach to it instead of
+// spawning a fresh child. Rather than making them figure out
+// `serverMode=external` + `serverUrl` inside settings.json manually, we
+// expose a simple hostname + port form here that writes those settings for
+// them.
+//
+// Preload: on render we ask the host for the current mode/url via
+// `getServerConfig`. Host answers with `serverConfig { mode, url }`, which
+// main.ts forwards to `applyServerConfig` below to fill the form.
+//
+// Commit: pressing Attach sends `applyServerConfig { mode: "external",
+// url }`. The host writes both keys to Global config and the existing
+// `onDidChangeConfiguration("opencode")` listener triggers reload() —
+// no need for the webview to force a reload itself.
+
+// DOM handles for the section, so applyServerConfig() (called from main.ts
+// with the host's reply) can update them without re-querying.
+let serverModeStatusEl: HTMLElement | null = null
+let serverHostInput: HTMLInputElement | null = null
+let serverPortInput: HTMLInputElement | null = null
+
+function renderServerConnectionSection(): HTMLElement {
+  const section = document.createElement("div")
+  section.className = "settings-section"
+
+  const heading = document.createElement("div")
+  heading.className = "settings-heading"
+  heading.textContent = "Server connection"
+  section.appendChild(heading)
+
+  const desc = document.createElement("div")
+  desc.className = "settings-hint"
+  desc.textContent =
+    "Attach this VSCode instance to an already-running opencode server (e.g. one you launched in a terminal with `opencode serve --port 4096`, so it inherits HTTPS_PROXY / NODE_EXTRA_CA_CERTS). Leave in spawn mode to let the extension start its own server."
+  section.appendChild(desc)
+
+  // Current status line — filled in by applyServerConfig().
+  serverModeStatusEl = document.createElement("div")
+  serverModeStatusEl.className = "settings-status"
+  serverModeStatusEl.style.margin = "6px 0"
+  serverModeStatusEl.textContent = "Loading current settings…"
+  section.appendChild(serverModeStatusEl)
+
+  // Host + port inputs. Small inline grid to keep them next to each other.
+  const grid = document.createElement("div")
+  grid.style.display = "flex"
+  grid.style.gap = "8px"
+  grid.style.alignItems = "flex-end"
+  grid.style.flexWrap = "wrap"
+  grid.style.marginTop = "6px"
+
+  const hostField = document.createElement("label")
+  hostField.className = "provider-form-field"
+  hostField.style.flex = "1 1 200px"
+  const hostLabel = document.createElement("span")
+  hostLabel.className = "provider-form-label"
+  hostLabel.textContent = "Hostname"
+  hostField.appendChild(hostLabel)
+  serverHostInput = document.createElement("input")
+  serverHostInput.type = "text"
+  serverHostInput.className = "provider-form-input"
+  serverHostInput.placeholder = "127.0.0.1"
+  serverHostInput.value = "127.0.0.1"
+  serverHostInput.spellcheck = false
+  hostField.appendChild(serverHostInput)
+  grid.appendChild(hostField)
+
+  const portField = document.createElement("label")
+  portField.className = "provider-form-field"
+  portField.style.flex = "0 0 120px"
+  const portLabel = document.createElement("span")
+  portLabel.className = "provider-form-label"
+  portLabel.textContent = "Port"
+  portField.appendChild(portLabel)
+  serverPortInput = document.createElement("input")
+  serverPortInput.type = "number"
+  serverPortInput.className = "provider-form-input"
+  serverPortInput.placeholder = "4096"
+  serverPortInput.value = "4096"
+  serverPortInput.min = "1"
+  serverPortInput.max = "65535"
+  portField.appendChild(serverPortInput)
+  grid.appendChild(portField)
+
+  section.appendChild(grid)
+
+  const actions = document.createElement("div")
+  actions.className = "settings-actions"
+  actions.style.marginTop = "10px"
+
+  const attachBtn = document.createElement("button")
+  attachBtn.className = "pill"
+  attachBtn.textContent = "Attach to external server"
+  attachBtn.addEventListener("click", () => submitAttachExternal())
+  actions.appendChild(attachBtn)
+
+  const spawnBtn = document.createElement("button")
+  spawnBtn.className = "pill"
+  spawnBtn.textContent = "Revert to spawn mode"
+  spawnBtn.addEventListener("click", () => {
+    postMessage({ type: "applyServerConfig", mode: "spawn" })
+    setStatus("Reverting to spawn mode…")
+  })
+  actions.appendChild(spawnBtn)
+
+  section.appendChild(actions)
+
+  // Fire off the request for current config; response goes through
+  // main.ts → applyServerConfig(). If we never get a reply (e.g. because
+  // the host lives in a different extension host process) the form still
+  // works with the built-in defaults (127.0.0.1:4096).
+  postMessage({ type: "getServerConfig" })
+
+  return section
+}
+
+function submitAttachExternal() {
+  if (!serverHostInput || !serverPortInput) return
+  const host = serverHostInput.value.trim() || "127.0.0.1"
+  const portStr = serverPortInput.value.trim()
+  const port = parseInt(portStr, 10)
+  if (!Number.isFinite(port) || port < 1 || port > 65535) {
+    setStatus("Port must be a number between 1 and 65535.")
+    serverPortInput.focus()
+    return
+  }
+  // Basic hostname sanity check — reject spaces / slashes / schemes so the
+  // resulting URL is well-formed. IPv6 hosts must already be wrapped in [].
+  if (/[\s/]/.test(host) || /^https?:/i.test(host)) {
+    setStatus("Enter a plain hostname (e.g. 127.0.0.1), no scheme or path.")
+    serverHostInput.focus()
+    return
+  }
+  const url = `http://${host}:${port}`
+  postMessage({ type: "applyServerConfig", mode: "external", url })
+  setStatus(`Attaching to ${url}…`)
+}
+
+/** Called from main.ts when the host replies with `serverConfig`. Preloads
+ *  the form with the currently-persisted mode/url (or, in spawn mode, with
+ *  the actual URL of the server the extension spawned) and updates the
+ *  status line. Safe to call multiple times — inputs are updated in place.
+ *
+ *  Prefill strategy:
+ *    • external mode → parse `url` (persisted opencode.serverUrl).
+ *    • spawn mode + spawnUrl given → parse spawnUrl. The user then sees
+ *      the real hostname/port of the child opencode server, and hitting
+ *      Attach re-targets this VSCode instance at that same address (which
+ *      is exactly what makes sense when they've launched their own
+ *      `opencode serve --port <p>` in a terminal).
+ *    • spawn mode + no spawnUrl (server not yet running) → parse `url`
+ *      as a last-resort fallback.
+ */
+export function applyServerConfig(
+  mode: "spawn" | "external",
+  url: string,
+  spawnUrl?: string,
+) {
+  // Which URL do we prefill the inputs from?
+  const prefillUrl = mode === "spawn" && spawnUrl ? spawnUrl : url
+
+  let host = "127.0.0.1"
+  let port = "4096"
+  try {
+    const u = new URL(prefillUrl)
+    if (u.hostname) host = u.hostname
+    if (u.port) port = u.port
+    else if (u.protocol === "https:") port = "443"
+    else if (u.protocol === "http:") port = "80"
+  } catch {
+    /* keep defaults */
+  }
+  if (serverHostInput) serverHostInput.value = host
+  if (serverPortInput) serverPortInput.value = port
+  if (serverModeStatusEl) {
+    if (mode === "external") {
+      serverModeStatusEl.textContent = `Currently: attached to external server ${url}`
+    } else if (spawnUrl) {
+      serverModeStatusEl.textContent = `Currently: spawn mode — extension spawned server at ${spawnUrl}`
+    } else {
+      serverModeStatusEl.textContent = `Currently: spawn mode (extension manages its own server)`
+    }
+  }
 }
 
 // ---- MCP tab ----

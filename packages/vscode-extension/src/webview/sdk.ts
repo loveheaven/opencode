@@ -562,11 +562,10 @@ export class OpencodeClient {
 }
 
 // Client-generated part id. The server assigns real IDs on save; this is fine
-// for optimistic parts sent in prompt_async payloads.
+// for optimistic parts sent in prompt_async payloads. Message IDs are NOT
+// generated here — see the note in webview/main.ts::sendPrompt. Letting the
+// server mint the message id keeps client-side and server-side ids in a
+// single, monotonic id-space, which the session prompt loop relies on.
 export function makePartID(): string {
   return `prt_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
-}
-
-export function makeMessageID(): string {
-  return `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
 }

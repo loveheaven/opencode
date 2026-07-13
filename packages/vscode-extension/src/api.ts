@@ -119,6 +119,11 @@ export type WebviewRequest =
   | HttpRequestMessage
   | SseOpenMessage
   | SseCloseMessage
+  | GetDebugRequest
+  | SetDebugRequest
+  | OpenDebugLogRequest
+  | GetServerConfigRequest
+  | ApplyServerConfigRequest
 
 export type ConfirmResponse = { type: "confirmResponse"; id: string; result: boolean }
 export type InputResponse = { type: "inputResponse"; id: string; value: string | undefined }
@@ -159,8 +164,63 @@ export type AddAttachmentsMessage = {
 }
 
 // Which settings tab to open when the overlay is shown.
-export type SettingsTab = "mcp" | "skills" | "plugins" | "providers"
+export type SettingsTab = "mcp" | "skills" | "plugins" | "providers" | "settings"
 export type ShowSettingsMessage = { type: "showSettings"; tab: SettingsTab }
+
+// Debug flag round-trips. Owned by the extension host (persisted via
+// `context.globalState`) so it survives webview reloads and is visible to
+// the http/sse proxy without needing a message on every request. Webview
+// asks for the current value on bootstrap and toggles it from the Settings
+// tab.
+export type GetDebugRequest = { type: "getDebug" }
+export type SetDebugRequest = { type: "setDebug"; enabled: boolean }
+export type OpenDebugLogRequest = { type: "openDebugLog" }
+export type DebugStateMessage = { type: "debugState"; enabled: boolean }
+
+// -----------------------------------------------------------------------
+// External-server connection settings
+// -----------------------------------------------------------------------
+// User story: user has already launched `opencode serve --port <n>` in a
+// terminal (typically to route traffic through mitmproxy or to inject
+// custom env vars). The Settings tab offers a small hostname+port form
+// that flips the extension into external-server mode and points it at
+// the given URL.
+//
+// The webview owns the form UI; the extension host owns the writes to
+// `opencode.serverMode` / `opencode.serverUrl` (the webview sandbox can't
+// touch the vscode configuration API directly). So we exchange two
+// messages: `getServerConfig` fetches current settings for the form to
+// preload, `applyServerConfig` commits the user's choice.
+
+/** Webview asks host for the current serverMode / serverUrl so the form
+ *  can preload the correct values. Host replies with `serverConfig`. */
+export type GetServerConfigRequest = { type: "getServerConfig" }
+export type ServerConfigMessage = {
+  type: "serverConfig"
+  mode: "spawn" | "external"
+  /** Persisted `opencode.serverUrl` — used when mode === "external". Kept as
+   *  the fallback for spawn mode too so a previously-configured external URL
+   *  isn't forgotten if the user toggles back and forth. */
+  url: string
+  /** When `mode === "spawn"` and a server is currently running (or was the
+   *  last one bound), this is the actual URL the extension spawned it on —
+   *  i.e. `http://127.0.0.1:<realPort>`. The port is derived from the
+   *  workspace-hash preferredPort() and may differ from the persisted
+   *  `opencode.serverUrl`. Webview uses this to prefill the hostname/port
+   *  inputs so "Attach" points at the real spawned server, not a stale
+   *  default. Absent (undefined) when we haven't spawned anything yet. */
+  spawnUrl?: string
+}
+
+/** Commit new settings. `mode: "external"` also requires `url`; `mode:
+ *  "spawn"` reverts to the extension spawning its own server (url is
+ *  ignored). onDidChangeConfiguration in extension.ts picks up the
+ *  write and reloads the webview automatically. */
+export type ApplyServerConfigRequest = {
+  type: "applyServerConfig"
+  mode: "spawn" | "external"
+  url?: string
+}
 
 export type ExtensionMessage =
   | BootstrapMessage
@@ -177,3 +237,5 @@ export type ExtensionMessage =
   | SseEndMessage
   | ConfirmResponse
   | InputResponse
+  | DebugStateMessage
+  | ServerConfigMessage
