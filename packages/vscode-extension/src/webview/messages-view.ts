@@ -18,18 +18,24 @@
 
 import { escapeHtml, renderMarkdown } from "./markdown"
 import type { Message, MessageWithParts, Part, TokenUsage, ToolPart } from "./sdk"
-import { refs, state, type MessageEntry } from "./shared"
+import { getClient, refs, state, type MessageEntry } from "./shared"
 import { openLightbox } from "./lightbox"
 
 let renderQuestionsCb: () => void = () => {}
 let postMessage: (msg: unknown) => void = () => {}
+// Optional: caller can wire this so the error card's "Start new session"
+// button can trigger the same flow as the toolbar "+" button. When left
+// unset, the button falls back to a soft no-op with a status message.
+let onNewSessionCb: (() => void) | undefined
 
 export function initMessagesView(deps: {
   renderQuestions: () => void
   postMessage: (msg: unknown) => void
+  onNewSession?: () => void
 }) {
   renderQuestionsCb = deps.renderQuestions
   postMessage = deps.postMessage
+  onNewSessionCb = deps.onNewSession
 }
 
 /** Ingest a full message+parts blob from /session/:id/message list. */
@@ -155,33 +161,509 @@ export function isAtBottom(): boolean {
 // only flash across the status line — quickly buried by the next "Ready"
 // or "Assistant is working…" — and users have no idea their prompt failed.
 //
-// The bubble is transient: it's appended directly to the DOM (not to
-// state.messages), so a full renderAllMessages() will wipe it. Fine —
-// once the user retries or moves on it should disappear anyway.
+// De-duplication contract: opencode fires `session.error` AND, in most
+// failure modes, also stores the same error onto the last assistant
+// message's `.error` field (see session/prompt.ts error path). Rendering
+// both would produce two identical cards stacked on top of each other.
+//
+// Strategy: prefer the assistant-message path (it's persistent, re-renders
+// on session switch, and is anchored to the correct turn). If the message
+// list already has a trailing assistant message that carries an error with
+// the same signature, we skip the standalone bubble. Otherwise we still
+// need one — some server-level errors (session startup, auth) fire before
+// any assistant message exists and only reach the user through the SSE
+// event.
+//
+// The standalone bubble is transient: it's appended directly to the DOM
+// (not into state.messages), so a full renderAllMessages() wipe replaces
+// it with the message-anchored card when the server later attaches the
+// error to the assistant turn.
 export function showSessionError(err: { name?: string; message?: string; data?: unknown }) {
+  if (hasMatchingMessageError(err)) return
   const wrap = document.createElement("div")
   wrap.className = "msg assistant session-error-msg"
   const bubble = document.createElement("div")
   bubble.className = "bubble prose"
-  const detail =
-    (err.message && err.message.trim()) ||
-    (err.data ? JSON.stringify(err.data) : "") ||
-    "The opencode server reported an error but did not include a message."
-  const nameLabel = err.name || "Session error"
-  const errEl = document.createElement("div")
-  errEl.className = "tool"
-  errEl.innerHTML =
-    `<div class="tool-header"><span class="tool-icon">⚠</span>` +
-    `<span class="tool-name">${escapeHtml(nameLabel)}</span>` +
-    `<span class="tool-status error">error</span></div>` +
-    `<div class="tool-body">${escapeHtml(detail)}</div>` +
-    `<div class="tool-body" style="opacity:0.7;font-size:11px;margin-top:6px">` +
-    `Check the model/provider settings (Providers tab) and the OpenCode Output panel for details.</div>`
-  bubble.appendChild(errEl)
+  bubble.appendChild(renderErrorCard(err))
   wrap.appendChild(bubble)
   const wasAtBottom = isAtBottom()
   refs.messages.appendChild(wrap)
   if (wasAtBottom) scrollToBottom()
+}
+
+// Look at the last assistant message: does it already carry an error whose
+// message text matches what we're about to render? Empty-message errors
+// aren't considered a match (the assistant-message renderer suppresses
+// those anyway).
+function hasMatchingMessageError(err: { name?: string; message?: string; data?: unknown }): boolean {
+  for (let i = state.messageOrder.length - 1; i >= 0; i--) {
+    const entry = state.messages.get(state.messageOrder[i])
+    if (!entry) continue
+    if (entry.info.role !== "assistant") continue
+    const existing = (entry.info as { error?: { name?: string; message?: string; data?: unknown } }).error
+    if (!existing) return false
+    return sameErrorSignature(existing, err)
+  }
+  return false
+}
+
+// Two errors count as "the same" for de-dup purposes if their message
+// texts are identical (after trim) OR the shorter one is a prefix of the
+// longer — opencode occasionally truncates one side. Falls back to a
+// data-payload comparison when neither carries a message string.
+function sameErrorSignature(
+  a: { message?: string; data?: unknown },
+  b: { message?: string; data?: unknown },
+): boolean {
+  const am = (a.message ?? "").trim()
+  const bm = (b.message ?? "").trim()
+  if (am && bm) {
+    if (am === bm) return true
+    const [short, long] = am.length < bm.length ? [am, bm] : [bm, am]
+    if (long.startsWith(short) && short.length > 30) return true
+  }
+  const ad = a.data ? safeStringify(a.data) : ""
+  const bd = b.data ? safeStringify(b.data) : ""
+  return !!ad && ad === bd
+}
+
+// -------------------------------------------------------------------------
+// Error card renderer (shared by showSessionError + assistant-message errors)
+// -------------------------------------------------------------------------
+//
+// opencode's APIError.message is often a dumped JSON blob from the upstream
+// provider — e.g. openrouter.woa.com returns
+//   {"error":{"message":"...","code":"4003"},"venusMarker":{...}}
+// with a 400. Rendering that raw makes the error card unreadable: the
+// interesting single line ("input X tokens > limit Y") is buried inside
+// ~500 chars of headers/metadata.
+//
+// The renderer here:
+//   1. Recognises a handful of well-known failure categories (context
+//      overflow, rate limit, auth, upstream 5xx, network) and shows a
+//      short human title + the most useful numbers extracted from the
+//      payload.
+//   2. Adds a category-specific "what to do next" line so users don't
+//      have to guess whether the problem is client-side config or an
+//      upstream limit.
+//   3. Collapses the raw JSON behind a "Show details" toggle so it's
+//      still available for support / bug reports but doesn't dominate
+//      the card by default.
+//
+// The parser is intentionally lenient: any regex we miss falls through to
+// a generic "APIError" render that still looks nicer than dumping the
+// stringified `data` field.
+type ErrorKind = "context" | "rate-limit" | "auth" | "upstream" | "network" | "generic"
+
+interface ClassifiedError {
+  kind: ErrorKind
+  title: string
+  summary: string
+  facts: Array<{ label: string; value: string }>
+  advice: string
+  raw: string
+}
+
+function classifyError(err: { name?: string; message?: string; data?: unknown }): ClassifiedError {
+  const rawMessage = (err.message ?? "").trim()
+  const rawData = err.data ? safeStringify(err.data) : ""
+  // Combined haystack for regex matching — we don't care whether the
+  // interesting substring came from the exception message or the response
+  // body; both routinely appear in either slot depending on which layer
+  // caught the error first.
+  const haystack = [rawMessage, rawData].filter(Boolean).join("\n")
+
+  // Try to pull an inner .error.message out of a JSON-looking blob so we
+  // can quote just the human-readable line instead of the whole envelope.
+  const inner = extractInnerErrorMessage(haystack)
+
+  // 1) Context length overflow. Upstream messages vary but almost always
+  //    include the two token counts and the word "context". Sample:
+  //    "The input (295615 tokens) is longer than the model's context
+  //    length (200000 tokens)."
+  const ctxMatch = haystack.match(
+    /input.{0,40}?(\d[\d,]*)\s*tokens?.{0,60}?context\s*length.{0,20}?(\d[\d,]*)/i,
+  )
+  if (
+    ctxMatch ||
+    /context[_ ]length[_ ]exceeded|maximum context length|too many input tokens/i.test(haystack)
+  ) {
+    const used = ctxMatch ? parseIntSafe(ctxMatch[1]) : undefined
+    const limit = ctxMatch ? parseIntSafe(ctxMatch[2]) : undefined
+    const facts: ClassifiedError["facts"] = []
+    if (used !== undefined) facts.push({ label: "Input tokens", value: used.toLocaleString() })
+    if (limit !== undefined) facts.push({ label: "Model limit", value: limit.toLocaleString() })
+    if (used !== undefined && limit !== undefined) {
+      const over = used - limit
+      facts.push({ label: "Over by", value: `${over.toLocaleString()} (${((used / limit - 1) * 100).toFixed(0)}%)` })
+    }
+    return {
+      kind: "context",
+      title: "Context length exceeded",
+      summary:
+        inner ||
+        (used !== undefined && limit !== undefined
+          ? `Input is ${used.toLocaleString()} tokens; upstream model accepts at most ${limit.toLocaleString()}.`
+          : "The message you sent (with history + tool output) is longer than the model's context window."),
+      facts,
+      advice:
+        limit !== undefined
+          ? `This turn's payload is already over the model's ${limit.toLocaleString()}-token cap. If the payload spike came from your latest message alone — an @-attached large file, or a huge tool result — “Compact this session” won't help, because compaction preserves the recent tail (including that message) so the model still has context to work with. In that case: start a new session, or re-@ the file with a smaller line range like \`file.ts:100-300\`. If the payload grew gradually across many turns, Compact should work.`
+          : "Click “Compact this session” to summarise the history, or start a new session. opencode only auto-compacts based on the previous turn's usage, so a single over-budget request always reaches the upstream and gets rejected.",
+      raw: haystack,
+    }
+  }
+
+  // 2) Rate limit / quota. openrouter, anthropic, openai all use 429.
+  if (/429|rate.?limit|too many requests|quota/i.test(haystack)) {
+    const retryMatch = haystack.match(/retry.{0,20}?(\d+)\s*(second|ms|milli)/i)
+    return {
+      kind: "rate-limit",
+      title: "Rate limit / quota",
+      summary: inner || "The upstream provider rejected the request because you've exceeded a rate or quota limit.",
+      facts: retryMatch ? [{ label: "Retry after", value: `${retryMatch[1]} ${retryMatch[2]}` }] : [],
+      advice:
+        "Wait a bit and resend, or switch to a different model / provider that isn't currently throttled.",
+      raw: haystack,
+    }
+  }
+
+  // 3) Authentication / authorisation.
+  if (/401|403|unauthori[sz]ed|invalid.{0,10}(api.?key|token)|authentication/i.test(haystack)) {
+    return {
+      kind: "auth",
+      title: "Authentication failed",
+      summary: inner || "The upstream provider rejected your credentials.",
+      facts: [],
+      advice:
+        "Open Settings → Providers and check the API key. For env-based providers, verify the environment variable is set in the extension host's shell (not just your terminal), then restart the server.",
+      raw: haystack,
+    }
+  }
+
+  // 4) Upstream 5xx / server-side error.
+  const statusMatch = haystack.match(/["']?status(?:Code)?["']?\s*[:=]\s*(\d{3})/)
+  const status = statusMatch ? parseIntSafe(statusMatch[1]) : undefined
+  if (status !== undefined && status >= 500) {
+    return {
+      kind: "upstream",
+      title: `Upstream error (HTTP ${status})`,
+      summary: inner || "The upstream model provider returned a server error.",
+      facts: [{ label: "Status", value: String(status) }],
+      advice: "Try again in a moment. If it persists, check the provider's status page or switch models.",
+      raw: haystack,
+    }
+  }
+
+  // 5) Network-level.
+  if (/ETIMEDOUT|ECONNRESET|ENOTFOUND|ECONNREFUSED|fetch failed|network/i.test(haystack)) {
+    return {
+      kind: "network",
+      title: "Network error",
+      summary: inner || "The extension couldn't reach the upstream provider.",
+      facts: [],
+      advice:
+        "Verify the provider's baseURL is reachable from this machine (curl it from the same shell VSCode was launched from). Corporate proxies often need HTTPS_PROXY set for the extension host too.",
+      raw: haystack,
+    }
+  }
+
+  // 6) Fallback — still nicer than the old raw dump.
+  return {
+    kind: "generic",
+    title: err.name || "APIError",
+    summary: inner || rawMessage || "The opencode server reported an error but did not include a message.",
+    facts: status !== undefined ? [{ label: "Status", value: String(status) }] : [],
+    advice: "Check the model/provider settings (Providers tab) and the OpenCode Output panel for the full response.",
+    raw: haystack,
+  }
+}
+
+// Extract a human-readable line out of a JSON envelope like
+// `{"error":{"message":"..."},"venusMarker":{...}}`. Falls back to
+// undefined when the input doesn't parse as JSON or when the shape
+// doesn't match anything we recognise — the classifier then keeps the
+// full haystack as the summary source.
+function extractInnerErrorMessage(text: string): string | undefined {
+  // Find the outermost { … } block in the text; opencode's APIError
+  // sometimes prefixes it with a stack-like string.
+  const start = text.indexOf("{")
+  if (start === -1) return undefined
+  const jsonSlice = text.slice(start)
+  try {
+    const parsed = JSON.parse(jsonSlice)
+    // Common shapes: { error: { message } }, { message }, { detail }.
+    const candidates: unknown[] = [
+      (parsed as { error?: { message?: string } })?.error?.message,
+      (parsed as { message?: string })?.message,
+      (parsed as { detail?: string })?.detail,
+      (parsed as { responseBody?: string })?.responseBody,
+    ]
+    for (const c of candidates) {
+      if (typeof c === "string" && c.trim()) {
+        // responseBody itself is a JSON string — recurse once so we drill
+        // through the "responseBody":"{\"error\":{...}}" wrapper opencode
+        // sometimes serialises around upstream errors.
+        const trimmed = c.trim()
+        if (trimmed.startsWith("{")) {
+          const nested = extractInnerErrorMessage(trimmed)
+          if (nested) return nested
+        }
+        return trimmed
+      }
+    }
+  } catch {
+    // not JSON — fine
+  }
+  return undefined
+}
+
+function parseIntSafe(s: string): number | undefined {
+  const n = Number(s.replace(/,/g, ""))
+  return Number.isFinite(n) ? n : undefined
+}
+
+function safeStringify(v: unknown): string {
+  if (typeof v === "string") return v
+  try {
+    return JSON.stringify(v)
+  } catch {
+    return String(v)
+  }
+}
+
+// Turn a ClassifiedError into a DOM node. Layout:
+//   ⚠ Title                                              [category badge]
+//   Human-readable summary sentence.
+//   • Fact 1: value    • Fact 2: value    (rendered as chips)
+//   💡 What to do next: …
+//   ▸ Show details      (click → reveals <pre> with raw payload)
+function renderErrorCard(err: { name?: string; message?: string; data?: unknown }): HTMLElement {
+  const c = classifyError(err)
+  const card = document.createElement("div")
+  card.className = `tool error-card error-card-${c.kind}`
+
+  const header = document.createElement("div")
+  header.className = "tool-header error-card-header"
+  const icon = document.createElement("span")
+  icon.className = "tool-icon"
+  icon.textContent = errorIconGlyph(c.kind)
+  header.appendChild(icon)
+  const title = document.createElement("span")
+  title.className = "tool-name"
+  title.textContent = c.title
+  header.appendChild(title)
+  const spacer = document.createElement("span")
+  spacer.style.flex = "1"
+  header.appendChild(spacer)
+  const badge = document.createElement("span")
+  badge.className = "tool-status error"
+  badge.textContent = "error"
+  header.appendChild(badge)
+  card.appendChild(header)
+
+  const body = document.createElement("div")
+  body.className = "tool-body error-card-body"
+
+  const summaryEl = document.createElement("div")
+  summaryEl.className = "error-card-summary"
+  summaryEl.textContent = c.summary
+  body.appendChild(summaryEl)
+
+  if (c.facts.length > 0) {
+    const facts = document.createElement("div")
+    facts.className = "error-card-facts"
+    for (const f of c.facts) {
+      const chip = document.createElement("span")
+      chip.className = "error-card-fact"
+      const k = document.createElement("span")
+      k.className = "error-card-fact-key"
+      k.textContent = f.label
+      const v = document.createElement("span")
+      v.className = "error-card-fact-val"
+      v.textContent = f.value
+      chip.appendChild(k)
+      chip.appendChild(v)
+      facts.appendChild(chip)
+    }
+    body.appendChild(facts)
+  }
+
+  if (c.advice) {
+    const advice = document.createElement("div")
+    advice.className = "error-card-advice"
+    const bulb = document.createElement("span")
+    bulb.className = "error-card-advice-icon"
+    bulb.textContent = "💡"
+    const text = document.createElement("span")
+    text.textContent = c.advice
+    advice.appendChild(bulb)
+    advice.appendChild(text)
+    body.appendChild(advice)
+  }
+
+  const actions = buildErrorActions(c)
+  if (actions) body.appendChild(actions)
+
+  // Raw payload folded away by default. We keep it because upstream error
+  // envelopes often carry a `spanId` / request-id users need to share with
+  // whoever runs the upstream service.
+  if (c.raw && c.raw.trim()) {
+    const details = document.createElement("details")
+    details.className = "error-card-details"
+    const summary = document.createElement("summary")
+    summary.textContent = "Show raw response"
+    details.appendChild(summary)
+    const pre = document.createElement("pre")
+    pre.className = "error-card-raw"
+    pre.textContent = c.raw
+    details.appendChild(pre)
+    // Add a copy button so users can grab the payload for bug reports
+    // without having to select-all inside the <pre>.
+    const copyBtn = document.createElement("button")
+    copyBtn.type = "button"
+    copyBtn.className = "error-card-copy"
+    copyBtn.textContent = "Copy"
+    copyBtn.addEventListener("click", async (ev) => {
+      ev.stopPropagation()
+      const ok = await copyToClipboard(c.raw)
+      copyBtn.textContent = ok ? "Copied" : "Copy failed"
+      setTimeout(() => (copyBtn.textContent = "Copy"), 1200)
+    })
+    details.appendChild(copyBtn)
+    body.appendChild(details)
+  }
+
+  card.appendChild(body)
+  return card
+}
+
+// Actionable follow-ups for an error card. Only the "context overflow"
+// class gets buttons because it's the only case where the webview can
+// meaningfully act without user input:
+//
+//   • Compact this session — calls POST /session/:id/summarize. The
+//     server not only produces the summary, it also runs a retry loop
+//     with `summary + tail turns` on the same session BEFORE returning.
+//     If the tail's last user message itself was over budget (typical
+//     when the message carried a large @-attachment or a big paste),
+//     that retry hits the same context-length error and produces a
+//     second error card below this one. We DON'T hide the second card
+//     — it's the source of truth for the retry failure. Instead we
+//     append a small "Compact requested — this session will auto-retry"
+//     hint to THIS card so the user isn't surprised when another error
+//     bubble shows up.
+//   • Start new session — hard reset, useful when compact isn't enough.
+//
+// Returns undefined when there's nothing useful to offer.
+function buildErrorActions(c: ClassifiedError): HTMLElement | undefined {
+  if (c.kind !== "context") return undefined
+
+  const row = document.createElement("div")
+  row.className = "error-card-actions"
+
+  // A single-line hint that appears below the buttons after the user
+  // clicks Compact. Made ahead of time so the click handler can flip
+  // it hidden→visible without rebuilding the action row. Explains the
+  // "why is there another error card underneath?" phenomenon.
+  const hint = document.createElement("div")
+  hint.className = "error-card-inline-hint"
+  hint.hidden = true
+  hint.textContent =
+    "Compact requested — this session will auto-retry. If the retry also fails, a new error card will appear below."
+
+  const compactBtn = document.createElement("button")
+  compactBtn.type = "button"
+  compactBtn.className = "error-card-action primary"
+  compactBtn.textContent = "Compact this session"
+  compactBtn.title =
+    "Ask opencode to summarise older history and auto-retry the last turn."
+  compactBtn.addEventListener("click", async () => {
+    const client = getClient()
+    const sessionID = state.sessionID
+    if (!client || !sessionID) {
+      compactBtn.textContent = "No active session"
+      return
+    }
+    const modelSel = pickSessionModel()
+    if (!modelSel) {
+      compactBtn.textContent = "No model configured"
+      return
+    }
+    compactBtn.disabled = true
+    compactBtn.textContent = "Compacting…"
+    hint.hidden = false
+    try {
+      await client.compactSession(sessionID, modelSel.providerID, modelSel.modelID)
+      compactBtn.textContent = "Done"
+      compactBtn.classList.add("done")
+    } catch (err) {
+      compactBtn.disabled = false
+      compactBtn.textContent = "Retry compact"
+      compactBtn.title = (err as Error).message
+    }
+  })
+  row.appendChild(compactBtn)
+
+  const newBtn = document.createElement("button")
+  newBtn.type = "button"
+  newBtn.className = "error-card-action"
+  newBtn.textContent = "Start new session"
+  newBtn.title = "Clear the current session and open an empty one."
+  newBtn.addEventListener("click", () => {
+    if (onNewSessionCb) onNewSessionCb()
+    else newBtn.textContent = "Use the “+” in the toolbar"
+  })
+  row.appendChild(newBtn)
+
+  // Wrap row + hint together so the caller only has to append a single
+  // node to the card body.
+  const wrap = document.createElement("div")
+  wrap.className = "error-card-actions-wrap"
+  wrap.appendChild(row)
+  wrap.appendChild(hint)
+  return wrap
+}
+
+// Best-effort look-up for the model to feed into the compact endpoint.
+// The session's last assistant/user message usually carries the exact
+// (provider, model) pair used for that turn; falling back to defaults
+// covers newly created sessions where nothing has been sent yet.
+function pickSessionModel(): { providerID: string; modelID: string } | undefined {
+  const sessionID = state.sessionID
+  if (sessionID) {
+    // Walk message order from newest to oldest; first entry with a model
+    // wins. Both roles record it (server echoes the assistant's routing
+    // model onto the user request too).
+    for (let i = state.messageOrder.length - 1; i >= 0; i--) {
+      const entry = state.messages.get(state.messageOrder[i])
+      const m = entry?.info.model
+      if (m?.providerID && m?.modelID) return { providerID: m.providerID, modelID: m.modelID }
+    }
+  }
+  const dm = state.defaultModel
+  if (dm && dm.includes("/")) {
+    const idx = dm.indexOf("/")
+    return { providerID: dm.slice(0, idx), modelID: dm.slice(idx + 1) }
+  }
+  return undefined
+}
+
+function errorIconGlyph(kind: ErrorKind): string {
+  switch (kind) {
+    case "context":
+      return "📏"
+    case "rate-limit":
+      return "⏱"
+    case "auth":
+      return "🔒"
+    case "upstream":
+      return "☁"
+    case "network":
+      return "🌐"
+    default:
+      return "⚠"
+  }
 }
 
 export function renderIncremental(messageID: string) {
@@ -201,6 +683,17 @@ export function renderIncremental(messageID: string) {
       const firstQuestion = refs.messages.querySelector(".question-card")
       if (firstQuestion) refs.messages.insertBefore(replacement, firstQuestion)
       else refs.messages.appendChild(replacement)
+    }
+    // When this message now carries an error, drop any standalone session-
+    // error bubble that showSessionError() may have added earlier: the SSE
+    // `session.error` event and the assistant-message `.error` field
+    // arrive out of order, and rendering both leaves the user staring at
+    // two identical cards.
+    const carriesError = (entry.info as { error?: unknown }).error !== undefined
+    if (carriesError) {
+      for (const stray of refs.messages.querySelectorAll(".session-error-msg")) {
+        stray.remove()
+      }
     }
   } else if (el) {
     // Message became renderless (e.g. still empty error placeholder); drop it.
@@ -314,13 +807,12 @@ function renderMessage(entry: MessageEntry): HTMLElement | null {
       if (p.type === "tool" || p.type === "reasoning" || p.type === "patch") return true
       return false
     })
-    const meaningfulError = !!(err && err.message && err.message.trim())
+    const meaningfulError = !!(err && ((err.message && err.message.trim()) || err.data))
     if (err && (hasContent || meaningfulError)) {
-      const detail = err.message?.trim() || (err.data ? JSON.stringify(err.data) : "(no details)")
-      const errEl = document.createElement("div")
-      errEl.className = "tool"
-      errEl.innerHTML = `<div class="tool-header"><span class="tool-icon">⚠</span><span class="tool-name">${escapeHtml(err.name || "Error")}</span><span class="tool-status error">error</span></div><div class="tool-body">${escapeHtml(detail)}</div>`
-      bubble.appendChild(errEl)
+      // Route both inline (per-message) and standalone (session) errors
+      // through renderErrorCard so users get the same categorised, human-
+      // readable presentation instead of a raw JSON dump.
+      bubble.appendChild(renderErrorCard(err))
     }
     if (!hasContent && !meaningfulError) return null
   }
@@ -606,18 +1098,53 @@ function renderToolPart(part: ToolPart): HTMLElement {
   div.dataset.partId = part.id
 
   const status = part.state.status
-  const statusText =
-    status === "running" ? "running" : status === "completed" ? "done" : status === "error" ? "failed" : "pending"
   const target = toolTarget(part)
 
+  // Header layout: icon · name · target · [actions | status]
+  //
+  // The tool card used to show a plain `done`/`failed`/`running` badge in the
+  // trailing slot. That's fine as a signal but wastes the most valuable pixel
+  // real estate for the two things users actually want to do on a finished
+  // tool call: copy the command (bash/shell) or jump to the file / see the
+  // diff (edit/write/apply_patch).
+  //
+  // We now render inline action buttons in that slot when the tool has
+  // completed successfully, and fall back to the textual status badge in
+  // every other state (running, error, pending) — those still need the
+  // badge because there's no useful action yet.
   const header = document.createElement("div")
   header.className = "tool-header"
-  header.innerHTML = `
-    <span class="tool-icon">${toolIcon(part.tool)}</span>
-    <span class="tool-name">${escapeHtml(part.tool)}</span>
-    <span class="tool-target">${escapeHtml(target)}</span>
-    <span class="tool-status ${status}">${statusText}</span>
-  `
+  const iconSpan = renderToolIconElement(part)
+  header.appendChild(iconSpan)
+  const nameSpan = document.createElement("span")
+  nameSpan.className = "tool-name"
+  nameSpan.textContent = part.tool
+  header.appendChild(nameSpan)
+  const targetSpan = document.createElement("span")
+  targetSpan.className = "tool-target"
+  targetSpan.textContent = target
+  targetSpan.title = target
+  header.appendChild(targetSpan)
+
+  const trailing = document.createElement("span")
+  trailing.className = "tool-trailing"
+  if (status === "completed") {
+    const actions = renderToolHeaderActions(part)
+    if (actions) trailing.appendChild(actions)
+    // Even when we render actions, keep a subtle "done" pill so users still
+    // get the visual completion signal — but pushed into the actions row so
+    // the buttons stay dominant. Uncomment if reviewers ask for it back;
+    // Codebuddy's UI omits it, so we do too.
+  } else {
+    const statusText =
+      status === "running" ? "running" : status === "error" ? "failed" : "pending"
+    const statusEl = document.createElement("span")
+    statusEl.className = `tool-status ${status}`
+    statusEl.textContent = statusText
+    trailing.appendChild(statusEl)
+  }
+  header.appendChild(trailing)
+
   const body = document.createElement("div")
   body.className = "tool-body collapsed"
   fillToolBody(body, part)
@@ -631,7 +1158,152 @@ function renderToolPart(part: ToolPart): HTMLElement {
   return div
 }
 
-function toolIcon(tool: string): string {
+// Build the inline action buttons for a completed tool call.
+// Returns undefined when the tool has no meaningful header action (in which
+// case renderToolPart falls back to omitting the trailing slot).
+//
+// bash/shell           → Copy command
+// edit/write/apply_patch → Open file · Diff
+// read                 → Open file
+// glob/grep            → (nothing — no single obvious action; the body
+//                        already shows the matches and users expand for it)
+function renderToolHeaderActions(part: ToolPart): HTMLElement | undefined {
+  const input = part.state.input as Record<string, unknown>
+  const filePath = pickPath(input)
+  const actions = document.createElement("span")
+  actions.className = "tool-actions"
+
+  if (part.tool === "bash" || part.tool === "shell") {
+    const command = typeof input.command === "string" ? input.command : ""
+    // bash gets a hover-only icon rather than a persistent button — copying
+    // the command is a nice-to-have, but the card is already busy and the
+    // button label repeated on every shell call was distracting. The icon
+    // fades in on tool hover (see .tool-action-icon in styles.css) and
+    // fades out when the pointer leaves.
+    if (command) actions.appendChild(makeCopyActionIcon("Copy command", command))
+  } else if (part.tool === "edit" || part.tool === "write" || part.tool === "apply_patch") {
+    if (filePath) {
+      actions.appendChild(
+        makeToolActionButton("Open", "Open file in editor", () => postMessage({ type: "openFile", path: filePath })),
+      )
+      actions.appendChild(
+        makeToolActionButton("Diff", "Show diff", () =>
+          showDiffForEdit(filePath, input, part.state as { metadata: Record<string, unknown> }),
+        ),
+      )
+    }
+  } else if (part.tool === "read") {
+    if (filePath) {
+      actions.appendChild(
+        makeToolActionButton("Open", "Open file in editor", () => postMessage({ type: "openFile", path: filePath })),
+      )
+    }
+  }
+
+  return actions.childElementCount > 0 ? actions : undefined
+}
+
+function pickPath(input: Record<string, unknown>): string | undefined {
+  for (const k of ["filePath", "path", "file"] as const) {
+    const v = input[k]
+    if (typeof v === "string" && v) return v
+  }
+  return undefined
+}
+
+// A tiny inline button used in the tool header. Consistent look with
+// .diff-btn but bound to a distinct class so we can hover-fade the whole
+// group without disturbing standalone buttons in the body. The click
+// handler receives the button element so callers that want to flash a
+// success/failure state (e.g. the Copy action) can update it in place.
+// stopPropagation is applied unconditionally so hitting a button never
+// also toggles the card's expand/collapse.
+function makeToolActionButton(
+  label: string,
+  tooltip: string,
+  onClick: (btn: HTMLButtonElement) => void | Promise<void>,
+): HTMLButtonElement {
+  const btn = document.createElement("button")
+  btn.className = "tool-action-btn"
+  btn.type = "button"
+  btn.textContent = label
+  btn.title = tooltip
+  btn.setAttribute("aria-label", tooltip)
+  btn.addEventListener("click", (ev) => {
+    ev.stopPropagation()
+    void onClick(btn)
+  })
+  return btn
+}
+
+// Ghost-styled copy icon that only becomes visible when the pointer is over
+// the parent .tool card (see .tool-action-icon in styles.css). Using an
+// icon rather than a labelled button keeps the shell/bash header visually
+// clean when the user is just skimming through a conversation, and only
+// surfaces the copy affordance when they actually hover to interact.
+//
+// The icon glyph mirrors the .copy-btn used on the message meta row (⧉);
+// keeping them identical means users only have to learn "the little copy
+// glyph" once. On click the icon briefly switches to a checkmark / bang
+// to confirm success or failure.
+function makeCopyActionIcon(tooltip: string, text: string): HTMLButtonElement {
+  const btn = document.createElement("button")
+  btn.className = "tool-action-icon"
+  btn.type = "button"
+  btn.textContent = "⧉"
+  btn.title = tooltip
+  btn.setAttribute("aria-label", tooltip)
+  btn.addEventListener("click", async (ev) => {
+    ev.stopPropagation()
+    const ok = await copyToClipboard(text)
+    const original = btn.textContent
+    btn.textContent = ok ? "✓" : "!"
+    btn.classList.add(ok ? "copied" : "copy-failed")
+    setTimeout(() => {
+      btn.textContent = original
+      btn.classList.remove("copied", "copy-failed")
+    }, 1200)
+  })
+  return btn
+}
+
+// Build the leading icon element for a tool card. For file-oriented tools
+// (read/edit/write/apply_patch) we render a small monospaced badge derived
+// from the file extension so users can tell at a glance whether the model
+// touched a TypeScript file, a markdown doc, a JSON config, etc. — much
+// more informative than a single ✎ glyph reused across every write. Falls
+// back to the plain emoji icon whenever the tool isn't file-scoped or we
+// can't extract a usable extension (e.g. an edit against a file with no
+// suffix).
+function renderToolIconElement(part: ToolPart): HTMLElement {
+  const span = document.createElement("span")
+  span.className = "tool-icon"
+
+  if (isFileTool(part.tool)) {
+    const input = part.state.input as Record<string, unknown>
+    const filePath = pickPath(input)
+    const info = filePath ? fileTypeInfo(filePath) : undefined
+    if (info) {
+      span.classList.add("tool-icon-filetype", `tool-icon-filetype-${info.className}`)
+      span.textContent = info.label
+      span.title = `${part.tool} · ${info.tooltip}`
+      return span
+    }
+  }
+
+  span.textContent = toolIconGlyph(part.tool)
+  return span
+}
+
+function isFileTool(tool: string): boolean {
+  return tool === "read" || tool === "write" || tool === "edit" || tool === "apply_patch"
+}
+
+// Fallback emoji glyphs for tools that either aren't file-scoped or have
+// no discoverable file path in their input (rare — usually a bug in the
+// caller). Kept as a lookup so renderToolIconElement can short-circuit
+// back to the old behaviour without a per-tool branch.
+function toolIconGlyph(tool: string): string {
   switch (tool) {
     case "read":
       return "📖"
@@ -652,19 +1324,140 @@ function toolIcon(tool: string): string {
   }
 }
 
+// Map a file path to a compact badge label + accent colour class. The
+// label is intentionally short (2-4 chars) so it fits in the same 14px
+// slot the old emoji occupied without pushing the tool name around. The
+// palette keys off .tool-icon-filetype-<key> in styles.css — add both
+// the entry here and a colour rule there when supporting a new extension.
+//
+// "Family" grouping (ts + tsx share one accent, js + jsx share one, etc.)
+// keeps related file types visually related; users care that a change
+// happened to "some JS-ish file" more than about the exact suffix.
+function fileTypeInfo(filePath: string): { label: string; className: string; tooltip: string } | undefined {
+  const base = filePath.split(/[\\/]/).pop() ?? filePath
+  // Special-case dotfiles / config files with well-known bare names before
+  // falling through to extension matching (e.g. "Dockerfile", "Makefile",
+  // ".gitignore"). Recognisable at a glance and worth their own badge.
+  const specials: Record<string, { label: string; className: string; tooltip: string }> = {
+    Dockerfile: { label: "DOC", className: "docker", tooltip: "Dockerfile" },
+    Makefile: { label: "MK", className: "make", tooltip: "Makefile" },
+    ".gitignore": { label: "GIT", className: "git", tooltip: ".gitignore" },
+    ".env": { label: "ENV", className: "env", tooltip: ".env file" },
+    "package.json": { label: "NPM", className: "npm", tooltip: "npm package.json" },
+    "tsconfig.json": { label: "TSC", className: "ts", tooltip: "TypeScript config" },
+  }
+  if (specials[base]) return specials[base]
+
+  const dot = base.lastIndexOf(".")
+  if (dot <= 0 || dot === base.length - 1) return undefined
+  const ext = base.slice(dot + 1).toLowerCase()
+
+  const table: Record<string, { label: string; className: string; tooltip: string }> = {
+    ts: { label: "TS", className: "ts", tooltip: "TypeScript" },
+    tsx: { label: "TSX", className: "ts", tooltip: "TypeScript React" },
+    mts: { label: "TS", className: "ts", tooltip: "TypeScript module" },
+    cts: { label: "TS", className: "ts", tooltip: "TypeScript CommonJS" },
+    js: { label: "JS", className: "js", tooltip: "JavaScript" },
+    jsx: { label: "JSX", className: "js", tooltip: "JavaScript React" },
+    mjs: { label: "JS", className: "js", tooltip: "JavaScript module" },
+    cjs: { label: "JS", className: "js", tooltip: "JavaScript CommonJS" },
+    py: { label: "PY", className: "py", tooltip: "Python" },
+    rb: { label: "RB", className: "rb", tooltip: "Ruby" },
+    go: { label: "GO", className: "go", tooltip: "Go" },
+    rs: { label: "RS", className: "rs", tooltip: "Rust" },
+    java: { label: "JV", className: "java", tooltip: "Java" },
+    kt: { label: "KT", className: "kotlin", tooltip: "Kotlin" },
+    swift: { label: "SW", className: "swift", tooltip: "Swift" },
+    c: { label: "C", className: "c", tooltip: "C" },
+    h: { label: "H", className: "c", tooltip: "C header" },
+    cpp: { label: "C++", className: "cpp", tooltip: "C++" },
+    cc: { label: "C++", className: "cpp", tooltip: "C++" },
+    hpp: { label: "H++", className: "cpp", tooltip: "C++ header" },
+    cs: { label: "C#", className: "csharp", tooltip: "C#" },
+    php: { label: "PHP", className: "php", tooltip: "PHP" },
+    md: { label: "MD", className: "md", tooltip: "Markdown" },
+    mdx: { label: "MDX", className: "md", tooltip: "MDX" },
+    markdown: { label: "MD", className: "md", tooltip: "Markdown" },
+    json: { label: "{}", className: "json", tooltip: "JSON" },
+    jsonc: { label: "{}", className: "json", tooltip: "JSON with comments" },
+    json5: { label: "{}", className: "json", tooltip: "JSON5" },
+    yml: { label: "YML", className: "yaml", tooltip: "YAML" },
+    yaml: { label: "YML", className: "yaml", tooltip: "YAML" },
+    toml: { label: "TOM", className: "toml", tooltip: "TOML" },
+    xml: { label: "XML", className: "xml", tooltip: "XML" },
+    html: { label: "<>", className: "html", tooltip: "HTML" },
+    htm: { label: "<>", className: "html", tooltip: "HTML" },
+    css: { label: "CSS", className: "css", tooltip: "CSS" },
+    scss: { label: "SCS", className: "css", tooltip: "Sass (SCSS)" },
+    sass: { label: "SAS", className: "css", tooltip: "Sass" },
+    less: { label: "LES", className: "css", tooltip: "Less" },
+    vue: { label: "VUE", className: "vue", tooltip: "Vue" },
+    svelte: { label: "SVL", className: "svelte", tooltip: "Svelte" },
+    sh: { label: "SH", className: "sh", tooltip: "Shell script" },
+    bash: { label: "SH", className: "sh", tooltip: "Bash script" },
+    zsh: { label: "SH", className: "sh", tooltip: "Zsh script" },
+    fish: { label: "SH", className: "sh", tooltip: "Fish script" },
+    ps1: { label: "PS1", className: "sh", tooltip: "PowerShell" },
+    sql: { label: "SQL", className: "sql", tooltip: "SQL" },
+    graphql: { label: "GQL", className: "gql", tooltip: "GraphQL" },
+    gql: { label: "GQL", className: "gql", tooltip: "GraphQL" },
+    proto: { label: "PB", className: "proto", tooltip: "Protocol Buffers" },
+    dockerfile: { label: "DOC", className: "docker", tooltip: "Dockerfile" },
+    lock: { label: "LCK", className: "lock", tooltip: "Lockfile" },
+    txt: { label: "TXT", className: "txt", tooltip: "Plain text" },
+    log: { label: "LOG", className: "txt", tooltip: "Log file" },
+    csv: { label: "CSV", className: "csv", tooltip: "CSV" },
+    tsv: { label: "TSV", className: "csv", tooltip: "TSV" },
+    png: { label: "IMG", className: "image", tooltip: "PNG image" },
+    jpg: { label: "IMG", className: "image", tooltip: "JPEG image" },
+    jpeg: { label: "IMG", className: "image", tooltip: "JPEG image" },
+    gif: { label: "IMG", className: "image", tooltip: "GIF image" },
+    webp: { label: "IMG", className: "image", tooltip: "WebP image" },
+    svg: { label: "SVG", className: "image", tooltip: "SVG image" },
+    pdf: { label: "PDF", className: "pdf", tooltip: "PDF" },
+    zip: { label: "ZIP", className: "archive", tooltip: "Zip archive" },
+    tar: { label: "TAR", className: "archive", tooltip: "Tar archive" },
+    gz: { label: "GZ", className: "archive", tooltip: "Gzip archive" },
+  }
+  if (table[ext]) return table[ext]
+
+  // Fallback: use the upper-cased extension itself (max 3 chars) so exotic
+  // suffixes still get a badge rather than the generic ✎ icon.
+  const label = ext.toUpperCase().slice(0, 3)
+  return { label, className: "generic", tooltip: `.${ext}` }
+}
+
 function toolTarget(part: ToolPart): string {
   const input = part.state.input as Record<string, unknown>
   const pick = (k: string) => (typeof input[k] === "string" ? (input[k] as string) : undefined)
-  return (
-    pick("filePath") ??
-    pick("path") ??
-    pick("file") ??
-    pick("command") ??
-    pick("pattern") ??
-    pick("query") ??
-    pick("description") ??
-    ""
-  )
+  // Prefer workspace-relative paths in the header — absolute paths are noisy
+  // and hide the useful suffix behind the ellipsis when the workspace root
+  // is deeply nested. `relativizeToWorkspace` returns the input unchanged if
+  // it doesn't sit under state.directory (e.g. a system path the model read
+  // for reference, or when directory isn't known yet), which keeps behaviour
+  // safe.
+  const filePath = pick("filePath") ?? pick("path") ?? pick("file")
+  if (filePath) return relativizeToWorkspace(filePath)
+  return pick("command") ?? pick("pattern") ?? pick("query") ?? pick("description") ?? ""
+}
+
+// Turn `/data/share/AgentRag/opencode/packages/…/foo.ts` into
+// `opencode/packages/…/foo.ts` when the state.directory prefix matches.
+// Falls back to the original path unchanged when:
+//   • state.directory hasn't been set yet (very early bootstrap render)
+//   • the path is already relative
+//   • the path lives outside the workspace (system dirs, home config, etc.)
+// The tool contract is "just make it shorter when we safely can" — never
+// silently invent a path that would open the wrong file.
+function relativizeToWorkspace(p: string): string {
+  const dir = state.directory
+  if (!dir) return p
+  if (!p.startsWith("/") && !/^[a-zA-Z]:[\\/]/.test(p)) return p // already relative
+  // Normalise trailing slash on dir so `/foo` + `/foo/bar` matches cleanly.
+  const prefix = dir.endsWith("/") ? dir : dir + "/"
+  if (p === dir) return "."
+  if (p.startsWith(prefix)) return p.slice(prefix.length) || "."
+  return p
 }
 
 function fillToolBody(body: HTMLElement, part: ToolPart) {
@@ -691,8 +1484,12 @@ function fillToolBody(body: HTMLElement, part: ToolPart) {
   if (filePath) {
     const link = document.createElement("span")
     link.className = "path-link"
-    link.textContent = filePath
-    link.title = "Open in editor"
+    // Show the relativized form for readability; keep the absolute path in
+    // the tooltip so users can still see the full location on hover and
+    // click still targets the absolute path (workspace-relative doesn't
+    // resolve reliably in vscode.workspace.openTextDocument).
+    link.textContent = relativizeToWorkspace(filePath)
+    link.title = filePath
     link.addEventListener("click", () => postMessage({ type: "openFile", path: filePath }))
     body.appendChild(link)
   }
@@ -706,14 +1503,9 @@ function fillToolBody(body: HTMLElement, part: ToolPart) {
       pre.style.margin = "6px 0 0 0"
       body.appendChild(pre)
     }
-    // Show diff button for edit/write
-    if (filePath && (part.tool === "edit" || part.tool === "write")) {
-      const btn = document.createElement("button")
-      btn.className = "diff-btn"
-      btn.textContent = "View diff"
-      btn.addEventListener("click", () => showDiffForEdit(filePath, input, part.state as { metadata: Record<string, unknown> }))
-      body.appendChild(btn)
-    }
+    // Note: the Diff button used to live here in the body; it's now surfaced
+    // inline in the tool header via renderToolHeaderActions so users don't
+    // have to expand the card first. See renderToolPart above.
   }
   if (part.state.status === "error") {
     const pre = document.createElement("pre")

@@ -119,11 +119,12 @@ export type WebviewRequest =
   | HttpRequestMessage
   | SseOpenMessage
   | SseCloseMessage
+  | WebviewReadyRequest
   | GetDebugRequest
   | SetDebugRequest
   | OpenDebugLogRequest
   | GetServerConfigRequest
-  | ApplyServerConfigRequest
+  | AttachToServerRequest
 
 export type ConfirmResponse = { type: "confirmResponse"; id: string; result: boolean }
 export type InputResponse = { type: "inputResponse"; id: string; value: string | undefined }
@@ -172,54 +173,53 @@ export type ShowSettingsMessage = { type: "showSettings"; tab: SettingsTab }
 // the http/sse proxy without needing a message on every request. Webview
 // asks for the current value on bootstrap and toggles it from the Settings
 // tab.
+/** Sent once by the webview iife right after it wires its `message`
+ *  event listener. Host replies with a fresh `bootstrap` (and re-sends
+ *  any late messages queued during startup). Fixes the race where under
+ *  remote-ssh / dev-containers the host posts bootstrap *before* the
+ *  webview has attached its listener — that message is dropped and the
+ *  panel sits at "Waiting for opencode server…" forever. */
+export type WebviewReadyRequest = { type: "webviewReady" }
+
 export type GetDebugRequest = { type: "getDebug" }
 export type SetDebugRequest = { type: "setDebug"; enabled: boolean }
 export type OpenDebugLogRequest = { type: "openDebugLog" }
 export type DebugStateMessage = { type: "debugState"; enabled: boolean }
 
 // -----------------------------------------------------------------------
-// External-server connection settings
+// Server connection settings
 // -----------------------------------------------------------------------
-// User story: user has already launched `opencode serve --port <n>` in a
-// terminal (typically to route traffic through mitmproxy or to inject
-// custom env vars). The Settings tab offers a small hostname+port form
-// that flips the extension into external-server mode and points it at
-// the given URL.
+// The Settings tab has a small hostname+port form that pins the URL the
+// extension prefers to talk to. On startup / on Attach the host probes
+// that URL, verifies it's opencode (identifyOpencode), and either
+// reattaches or spawns a fresh local server as a fallback.
 //
-// The webview owns the form UI; the extension host owns the writes to
-// `opencode.serverMode` / `opencode.serverUrl` (the webview sandbox can't
-// touch the vscode configuration API directly). So we exchange two
-// messages: `getServerConfig` fetches current settings for the form to
-// preload, `applyServerConfig` commits the user's choice.
+// Two messages: `getServerConfig` fetches the currently-live URL so the
+// form can preload it; `attachToServer` commits a new preferred URL.
 
-/** Webview asks host for the current serverMode / serverUrl so the form
- *  can preload the correct values. Host replies with `serverConfig`. */
+/** Webview asks host for the currently-connected URL so the form and the
+ *  live-connection banner can preload correctly. Host replies with
+ *  `serverConfig`. */
 export type GetServerConfigRequest = { type: "getServerConfig" }
 export type ServerConfigMessage = {
   type: "serverConfig"
-  mode: "spawn" | "external"
-  /** Persisted `opencode.serverUrl` — used when mode === "external". Kept as
-   *  the fallback for spawn mode too so a previously-configured external URL
-   *  isn't forgotten if the user toggles back and forth. */
-  url: string
-  /** When `mode === "spawn"` and a server is currently running (or was the
-   *  last one bound), this is the actual URL the extension spawned it on —
-   *  i.e. `http://127.0.0.1:<realPort>`. The port is derived from the
-   *  workspace-hash preferredPort() and may differ from the persisted
-   *  `opencode.serverUrl`. Webview uses this to prefill the hostname/port
-   *  inputs so "Attach" points at the real spawned server, not a stale
-   *  default. Absent (undefined) when we haven't spawned anything yet. */
-  spawnUrl?: string
+  /** The URL the webview is *actually* connected to right now (spawned,
+   *  reattached, or user-attached). Undefined only during early bootstrap
+   *  before the first successful connection. */
+  activeUrl?: string
+  /** How we ended up on `activeUrl` this session. Drives the small
+   *  parenthetical badge next to the URL in Settings. */
+  activeSource?: "spawned" | "reattached" | "external"
 }
 
-/** Commit new settings. `mode: "external"` also requires `url`; `mode:
- *  "spawn"` reverts to the extension spawning its own server (url is
- *  ignored). onDidChangeConfiguration in extension.ts picks up the
- *  write and reloads the webview automatically. */
-export type ApplyServerConfigRequest = {
-  type: "applyServerConfig"
-  mode: "spawn" | "external"
-  url?: string
+/** User wants the extension to prefer this URL from now on. Host verifies
+ *  it's an opencode server (identifyOpencode) and records it as the
+ *  remembered last-server URL in globalState, then reloads the webview so
+ *  it rebinds against that URL. If the URL isn't reachable / isn't
+ *  opencode, the host falls back to spawning a fresh local server. */
+export type AttachToServerRequest = {
+  type: "attachToServer"
+  url: string
 }
 
 export type ExtensionMessage =

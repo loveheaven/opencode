@@ -33,7 +33,7 @@ cd packages/opencode
 bun run dev web --port 4096
 ```
 
-The default URL the extension looks at is `http://127.0.0.1:4096`. To change it, run **OpenCode: Set Server URL** from the command palette, or edit `opencode.serverUrl` in settings.
+The extension will try to reattach to the last opencode server it successfully talked to (persisted in globalState). If that URL is unreachable or isn't opencode, it spawns a fresh local server. To pin a specific host/port, use the **Server connection** section in the OpenCode Settings tab.
 
 If you want to debug the server too:
 
@@ -59,12 +59,17 @@ The panel embeds `http://127.0.0.1:4096/` in an iframe. The CSP allows WebSocket
 
 ## Settings
 
+Pinning a specific opencode server URL is done from the **Server connection** section in the OpenCode Settings tab (which writes to `globalState`, not `settings.json`). Only a small handful of low-level knobs live in VSCode settings:
+
 | Key | Default | Description |
 |---|---|---|
-| `opencode.serverUrl` | `http://127.0.0.1:4096` | Where the opencode server lives. |
-| `opencode.password` | _empty_ | Set to match `OPENCODE_SERVER_PASSWORD` if your server is authenticated. |
-| `opencode.healthCheckPath` | `/` | Path used to probe reachability. |
-| `opencode.openOnStartup` | `false` | Auto-open the panel when VSCode starts. |
+| `opencode.port` | `0` | Preferred TCP port when spawning. `0` = derive a stable per-workspace port. |
+| `opencode.launcher` | `auto` | `auto` / `cli` / `source`. Which binary to spawn. |
+| `opencode.opencodePath` | _empty_ | Explicit path to the opencode CLI. |
+| `opencode.bunPath` | _empty_ | Explicit path to bun (source-mode only). |
+| `opencode.repoPath` | _empty_ | Explicit path to the opencode repo root (source-mode only). |
+| `opencode.defaultAgent` | _empty_ | Default agent name. |
+| `opencode.defaultModel` | _empty_ | Default model as `providerID/modelID`. |
 
 ## Notes on Remote-SSH / Dev Containers
 

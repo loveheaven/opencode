@@ -314,6 +314,25 @@ export class OpencodeClient {
     return this.json<boolean>(`/session/${encodeURIComponent(sessionID)}/abort`, { method: "POST" })
   }
 
+  // Kick off a summarise/compact pass on the given session. Reduces the
+  // conversation history to a rolling summary + a small tail so subsequent
+  // prompts fit under the model's context window. Server-side this is the
+  // exact same code path the `/compact` slash command triggers.
+  //
+  // Sent as `auto: false` so the server treats it as an explicit user
+  // request rather than an autonomous overflow-driven decision (only
+  // affects logging / event.reason).
+  compactSession(
+    sessionID: string,
+    providerID: string,
+    modelID: string,
+  ): Promise<boolean> {
+    return this.json<boolean>(`/session/${encodeURIComponent(sessionID)}/summarize`, {
+      method: "POST",
+      body: JSON.stringify({ providerID, modelID, auto: false }),
+    })
+  }
+
   status(): Promise<Record<string, { type: string }>> {
     return this.json(`/session/status`)
   }

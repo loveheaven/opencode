@@ -2,7 +2,7 @@
   "name": "opencode-vscode",
   "displayName": "OpenCode",
   "description": "OpenCode chat inside VSCode. Talks to a local opencode server over its HTTP API.",
-  "version": "0.26.8",
+  "version": "0.26.18",
   "private": true,
   "publisher": "opencode-ai",
   "engines": {
@@ -86,20 +86,6 @@
     "configuration": {
       "title": "OpenCode",
       "properties": {
-        "opencode.serverMode": {
-          "type": "string",
-          "enum": ["spawn", "external"],
-          "default": "spawn",
-          "enumDescriptions": [
-            "The extension spawns `bun run serve` from the opencode repo and manages its lifecycle.",
-            "Connect to an already-running server at opencode.serverUrl."
-          ]
-        },
-        "opencode.serverUrl": {
-          "type": "string",
-          "default": "http://127.0.0.1:4096",
-          "description": "External server URL (used only when opencode.serverMode = external)."
-        },
         "opencode.port": {
           "type": "number",
           "default": 0,
