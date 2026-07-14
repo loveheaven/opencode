@@ -174,28 +174,21 @@ function renderSettingsSubTab() {
 
 // ---- Server connection section ----
 //
-// User story: someone launched `opencode serve --port <n>` in a terminal
-// (typically to inherit HTTPS_PROXY / NODE_EXTRA_CA_CERTS for mitmproxy
-// interception) and wants this VSCode instance to attach to it instead of
-// spawning a fresh child. Rather than making them figure out
-// `serverMode=external` + `serverUrl` inside settings.json manually, we
-// expose a simple hostname + port form here that writes those settings for
-// them.
+// Preload: on render we ask the host for the live URL via `getServerConfig`.
+// Host answers with `serverConfig { activeUrl, activeSource }`, which
+// main.ts forwards to `applyServerConfig` below to fill the banner and form.
 //
-// Preload: on render we ask the host for the current mode/url via
-// `getServerConfig`. Host answers with `serverConfig { mode, url }`, which
-// main.ts forwards to `applyServerConfig` below to fill the form.
-//
-// Commit: pressing Attach sends `applyServerConfig { mode: "external",
-// url }`. The host writes both keys to Global config and the existing
-// `onDidChangeConfiguration("opencode")` listener triggers reload() —
-// no need for the webview to force a reload itself.
+// Commit: pressing Attach sends `attachToServer { url }`. The host verifies
+// the URL is an opencode server, records it in globalState, and reloads the
+// webview against it — or falls back to spawning fresh if verification fails.
 
 // DOM handles for the section, so applyServerConfig() (called from main.ts
 // with the host's reply) can update them without re-querying.
-let serverModeStatusEl: HTMLElement | null = null
 let serverHostInput: HTMLInputElement | null = null
 let serverPortInput: HTMLInputElement | null = null
+// Live connection banner: hostname + port + source badge. Rendered above the
+// form so the user always sees the URL the webview is currently talking to.
+let activeConnectionEl: HTMLElement | null = null
 
 function renderServerConnectionSection(): HTMLElement {
   const section = document.createElement("div")
@@ -206,18 +199,16 @@ function renderServerConnectionSection(): HTMLElement {
   heading.textContent = "Server connection"
   section.appendChild(heading)
 
-  const desc = document.createElement("div")
-  desc.className = "settings-hint"
-  desc.textContent =
-    "Attach this VSCode instance to an already-running opencode server (e.g. one you launched in a terminal with `opencode serve --port 4096`, so it inherits HTTPS_PROXY / NODE_EXTRA_CA_CERTS). Leave in spawn mode to let the extension start its own server."
-  section.appendChild(desc)
-
-  // Current status line — filled in by applyServerConfig().
-  serverModeStatusEl = document.createElement("div")
-  serverModeStatusEl.className = "settings-status"
-  serverModeStatusEl.style.margin = "6px 0"
-  serverModeStatusEl.textContent = "Loading current settings…"
-  section.appendChild(serverModeStatusEl)
+  // Live "Currently connected to …" banner. Ships bold/monospaced so it
+  // reads at a glance and doesn't blend into the surrounding hints.
+  activeConnectionEl = document.createElement("div")
+  activeConnectionEl.className = "settings-status"
+  activeConnectionEl.style.margin = "10px 0 4px 0"
+  activeConnectionEl.style.padding = "8px 10px"
+  activeConnectionEl.style.border = "1px solid var(--vscode-panel-border, rgba(128,128,128,0.3))"
+  activeConnectionEl.style.borderRadius = "4px"
+  activeConnectionEl.textContent = "Currently connected to: (waiting…)"
+  section.appendChild(activeConnectionEl)
 
   // Host + port inputs. Small inline grid to keep them next to each other.
   const grid = document.createElement("div")
@@ -268,18 +259,9 @@ function renderServerConnectionSection(): HTMLElement {
 
   const attachBtn = document.createElement("button")
   attachBtn.className = "pill"
-  attachBtn.textContent = "Attach to external server"
-  attachBtn.addEventListener("click", () => submitAttachExternal())
+  attachBtn.textContent = "Attach"
+  attachBtn.addEventListener("click", () => submitAttach())
   actions.appendChild(attachBtn)
-
-  const spawnBtn = document.createElement("button")
-  spawnBtn.className = "pill"
-  spawnBtn.textContent = "Revert to spawn mode"
-  spawnBtn.addEventListener("click", () => {
-    postMessage({ type: "applyServerConfig", mode: "spawn" })
-    setStatus("Reverting to spawn mode…")
-  })
-  actions.appendChild(spawnBtn)
 
   section.appendChild(actions)
 
@@ -292,7 +274,7 @@ function renderServerConnectionSection(): HTMLElement {
   return section
 }
 
-function submitAttachExternal() {
+function submitAttach() {
   if (!serverHostInput || !serverPortInput) return
   const host = serverHostInput.value.trim() || "127.0.0.1"
   const portStr = serverPortInput.value.trim()
@@ -310,53 +292,77 @@ function submitAttachExternal() {
     return
   }
   const url = `http://${host}:${port}`
-  postMessage({ type: "applyServerConfig", mode: "external", url })
+  // No more "external mode" concept — we just tell the host "prefer this
+  // URL from now on". Host verifies it's opencode, if so records it as the
+  // remembered last-server and reloads. If it isn't reachable / isn't
+  // opencode, host falls back to spawn as usual (same policy as startup).
+  postMessage({ type: "attachToServer", url })
   setStatus(`Attaching to ${url}…`)
 }
 
-/** Called from main.ts when the host replies with `serverConfig`. Preloads
- *  the form with the currently-persisted mode/url (or, in spawn mode, with
- *  the actual URL of the server the extension spawned) and updates the
- *  status line. Safe to call multiple times — inputs are updated in place.
- *
- *  Prefill strategy:
- *    • external mode → parse `url` (persisted opencode.serverUrl).
- *    • spawn mode + spawnUrl given → parse spawnUrl. The user then sees
- *      the real hostname/port of the child opencode server, and hitting
- *      Attach re-targets this VSCode instance at that same address (which
- *      is exactly what makes sense when they've launched their own
- *      `opencode serve --port <p>` in a terminal).
- *    • spawn mode + no spawnUrl (server not yet running) → parse `url`
- *      as a last-resort fallback.
- */
+/** Called from main.ts when the host replies with `serverConfig`.
+ *  Prefills the Hostname/Port inputs from the live URL and updates the
+ *  "Currently connected to …" banner. Safe to call multiple times. */
 export function applyServerConfig(
-  mode: "spawn" | "external",
-  url: string,
-  spawnUrl?: string,
+  activeUrl?: string,
+  activeSource?: "spawned" | "reattached" | "external",
 ) {
-  // Which URL do we prefill the inputs from?
-  const prefillUrl = mode === "spawn" && spawnUrl ? spawnUrl : url
-
-  let host = "127.0.0.1"
-  let port = "4096"
-  try {
-    const u = new URL(prefillUrl)
-    if (u.hostname) host = u.hostname
-    if (u.port) port = u.port
-    else if (u.protocol === "https:") port = "443"
-    else if (u.protocol === "http:") port = "80"
-  } catch {
-    /* keep defaults */
+  // Prefill the Attach form from the live URL — hitting Attach on it
+  // just pins the current connection. When there is no live URL yet the
+  // form keeps whatever defaults were set on render (127.0.0.1:4096).
+  if (activeUrl) {
+    let host = "127.0.0.1"
+    let port = "4096"
+    try {
+      const u = new URL(activeUrl)
+      if (u.hostname) host = u.hostname
+      if (u.port) port = u.port
+      else if (u.protocol === "https:") port = "443"
+      else if (u.protocol === "http:") port = "80"
+    } catch {
+      /* keep defaults */
+    }
+    if (serverHostInput) serverHostInput.value = host
+    if (serverPortInput) serverPortInput.value = port
   }
-  if (serverHostInput) serverHostInput.value = host
-  if (serverPortInput) serverPortInput.value = port
-  if (serverModeStatusEl) {
-    if (mode === "external") {
-      serverModeStatusEl.textContent = `Currently: attached to external server ${url}`
-    } else if (spawnUrl) {
-      serverModeStatusEl.textContent = `Currently: spawn mode — extension spawned server at ${spawnUrl}`
+
+  // Live-connection banner. Render as `host:port (source)` with the source
+  // spelled out in human words. If we don't have an active URL yet the
+  // webview just booted — show a neutral placeholder.
+  if (activeConnectionEl) {
+    if (activeUrl) {
+      let hostPort = activeUrl
+      try {
+        const u = new URL(activeUrl)
+        const hp = u.port || (u.protocol === "https:" ? "443" : "80")
+        hostPort = `${u.hostname}:${hp}`
+      } catch {
+        /* keep raw url */
+      }
+      const sourceLabel =
+        activeSource === "external"
+          ? "external attach"
+          : activeSource === "reattached"
+            ? "reattached to previous server"
+            : activeSource === "spawned"
+              ? "spawned by extension"
+              : "connected"
+      activeConnectionEl.innerHTML = ""
+      const label = document.createElement("span")
+      label.textContent = "Currently connected to: "
+      const code = document.createElement("strong")
+      code.style.fontFamily = "var(--vscode-editor-font-family, monospace)"
+      code.textContent = hostPort
+      const badge = document.createElement("span")
+      badge.style.marginLeft = "8px"
+      badge.style.opacity = "0.75"
+      badge.style.fontSize = "0.9em"
+      badge.textContent = `(${sourceLabel})`
+      activeConnectionEl.appendChild(label)
+      activeConnectionEl.appendChild(code)
+      activeConnectionEl.appendChild(badge)
     } else {
-      serverModeStatusEl.textContent = `Currently: spawn mode (extension manages its own server)`
+      activeConnectionEl.textContent = "Currently connected to: (no live connection yet)"
     }
   }
 }

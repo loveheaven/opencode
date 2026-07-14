@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import * as http from "node:http"
 import { URL } from "node:url"
-import { ServerManager, probeOnce, type ServerStatus } from "./server-manager"
+import { ServerManager, identifyOpencode, probeOnce, type ServerStatus } from "./server-manager"
 import type { AttachmentPayload, BootstrapMessage, ExtensionMessage, WebviewRequest } from "./api"
 import { pathToFileURL } from "node:url"
 
@@ -14,6 +14,16 @@ const VIEW_ID = "opencode.chat"
 // channel so users can inspect what the webview and the opencode server
 // are actually exchanging.
 const DEBUG_LOG_KEY = "opencode.debugLog"
+// Remembers the URL of the last opencode server we successfully talked to,
+// regardless of whether the extension spawned it or the user pointed us at
+// an already-running one. On next activation resolveServerUrlWithFallback()
+// probes this URL first (via ServerManager.start(preferredUrl) and
+// identifyOpencode) and reuses it if it's still an opencode server. This is
+// what makes "the extension attaches to the same host:port next time it
+// starts" work across VSCode restarts and reloads. Stored in globalState so
+// it's shared across workspaces — pick one running server and every window
+// finds it.
+const LAST_SERVER_URL_KEY = "opencode.lastServerUrl"
 // Cap for logged bodies. Prompt/streaming responses can be many megabytes;
 // truncating keeps the output panel responsive while still surfacing enough
 // to reproduce most bugs.
@@ -86,15 +96,6 @@ function getConfig() {
   return vscode.workspace.getConfiguration("opencode")
 }
 
-function getServerMode(): "spawn" | "external" {
-  const mode = getConfig().get<string>("serverMode", "spawn").trim()
-  return mode === "external" ? "external" : "spawn"
-}
-
-function getExternalUrl(): string {
-  return getConfig().get<string>("serverUrl", "http://127.0.0.1:4096").trim().replace(/\/+$/, "")
-}
-
 function getWorkspaceDirectory(): string | undefined {
   const folders = vscode.workspace.workspaceFolders
   if (!folders || folders.length === 0) return undefined
@@ -118,9 +119,15 @@ function themeKind(): BootstrapMessage["themeKind"] {
   }
 }
 
+type ActiveSource = "spawned" | "reattached" | "external"
+
 class OpencodeViewProvider implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | undefined
   private lastServerUrl: string | undefined
+  // How the current lastServerUrl was resolved. Cleared on spawn errors,
+  // updated by resolveServerUrlWithFallback and onServerStatus. Settings
+  // uses it to label the "Currently talking to …" badge honestly.
+  private activeSource: ActiveSource | undefined
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -157,6 +164,8 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
     if (!this.view) return
     if (status.state === "ready") {
       this.lastServerUrl = status.url
+      // Fire-and-forget: persist the newly-live URL so next start reattaches.
+      void this.setLastServerUrl(status.url)
       void this.sendBootstrap()
       return
     }
@@ -205,50 +214,72 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
   // Central "which URL should the webview talk to?" decision. Called from
   // resolveWebviewView() and reload() so both paths behave identically.
   //
-  // Policy (per user request):
-  //   • serverMode === "spawn"     → spawn (or reuse) a local server.
-  //   • serverMode === "external"  → probe the configured URL with a short
-  //                                   timeout. If it answers, attach. If it
-  //                                   doesn't, fall back to spawn so the user
-  //                                   isn't left staring at a "Server not
-  //                                   ready" panel just because their
-  //                                   external server isn't running yet.
+  // Policy: reattach if we can, spawn if we can't.
+  //   1. Cache: if this session already has a ready server via
+  //      ServerManager, and the caller opted into cache reuse, return that
+  //      URL. Prevents gratuitous restarts on unrelated config changes.
+  //   2. Reattach: probe the last URL we successfully connected to
+  //      (globalState). If /doc identifies it as opencode, reuse it.
+  //   3. Spawn: start a fresh local server via ServerManager.
   //
-  // Any fallback is logged so it's visible in the OpenCode output channel.
-  // We deliberately do NOT rewrite `opencode.serverMode` to "spawn" on
-  // fallback — the user's intent (attach when possible) is preserved, and
-  // next reload will retry the external URL first.
+  // Whichever URL we end up on gets written back to globalState so the
+  // *next* start has something to reattach to.
   private async resolveServerUrlWithFallback(opts?: { preferCachedSpawn?: boolean }): Promise<string | undefined> {
-    if (getServerMode() === "spawn") {
-      // Reuse a live server when we can — reload() should never gratuitously
-      // restart the child just because the user tweaked an unrelated setting.
-      if (opts?.preferCachedSpawn) {
-        const cached = this.server.getStatus()
-        if (cached.state === "ready") return cached.url
-      }
-      const status = await this.server.ensureRunning()
-      return status.state === "ready" ? status.url : undefined
+    if (opts?.preferCachedSpawn) {
+      const cached = this.server.getStatus()
+      if (cached.state === "ready") return cached.url
     }
 
-    // external
-    const externalUrl = getExternalUrl()
-    this.output.appendLine(`[opencode-ext] external mode: probing ${externalUrl}`)
-    const alive = await probeOnce(externalUrl)
-    if (alive) {
-      this.output.appendLine(`[opencode-ext] external server reachable — attaching to ${externalUrl}`)
-      return externalUrl
+    const lastUrl = this.getLastServerUrl()
+    if (lastUrl) {
+      this.output.appendLine(`[opencode-ext] probing last-known server ${lastUrl}`)
+      if (await identifyOpencode(lastUrl)) {
+        this.output.appendLine(`[opencode-ext] reattached to ${lastUrl}`)
+        // Seed ServerManager status too, so getStatus() reflects the
+        // reattached URL (settings display + reload() cache depend on it).
+        const status = await this.server.ensureRunning(lastUrl)
+        if (status.state === "ready") {
+          this.activeSource = "reattached"
+          await this.setLastServerUrl(status.url)
+          return status.url
+        }
+      } else {
+        this.output.appendLine(`[opencode-ext] last-known ${lastUrl} not opencode (or gone); spawning`)
+      }
     }
-    this.output.appendLine(
-      `[opencode-ext] external server ${externalUrl} did not respond within probe timeout; falling back to spawn`,
-    )
+
     const status = await this.server.ensureRunning()
     if (status.state === "ready") {
-      vscode.window.showInformationMessage(
-        `OpenCode: could not reach ${externalUrl}, spawned a local server instead.`,
-      )
+      this.activeSource = "spawned"
+      await this.setLastServerUrl(status.url)
       return status.url
     }
+    this.activeSource = undefined
     return undefined
+  }
+
+  private getLastServerUrl(): string | undefined {
+    const raw = this.context.globalState.get<string>(LAST_SERVER_URL_KEY)
+    if (!raw) return undefined
+    const trimmed = raw.trim().replace(/\/+$/, "")
+    if (!trimmed) return undefined
+    try {
+      // Reject anything that doesn't parse as a URL so a corrupted state
+      // (e.g. from an older extension version that stored a different
+      // shape) can't wedge us into an infinite failure loop.
+      new URL(trimmed)
+      return trimmed
+    } catch {
+      return undefined
+    }
+  }
+
+  private async setLastServerUrl(url: string): Promise<void> {
+    const clean = url.trim().replace(/\/+$/, "")
+    const prev = this.context.globalState.get<string>(LAST_SERVER_URL_KEY)
+    if (prev === clean) return
+    await this.context.globalState.update(LAST_SERVER_URL_KEY, clean)
+    this.output.appendLine(`[opencode-ext] remembered last server URL: ${clean}`)
   }
 
   // Public entry so extension commands can jump straight into the config
@@ -264,7 +295,10 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
     await revealView()
     // Ensure server is up so the panel's fetches work; also lets the
     // webview receive the bootstrap before we ask it to render settings.
-    if (getServerMode() === "spawn") await this.server.ensureRunning()
+    // Uses the same reattach-or-spawn policy as startup.
+    if (!this.lastServerUrl) {
+      this.lastServerUrl = await this.resolveServerUrlWithFallback()
+    }
     this.view?.webview.postMessage({ type: "showSettings", tab })
   }
 
@@ -317,12 +351,21 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
     this.view?.webview.postMessage({ type: "addAttachments", attachments } satisfies ExtensionMessage)
   }
 
+  // "Restart Server" always spawns a brand-new local server, no matter what
+  // we were previously connected to. If the current connection is a reused
+  // external one we have no handle on the process and cannot kill it — but
+  // starting our own gives the user a working panel immediately. The newly
+  // spawned URL then becomes the remembered "last URL".
   async restartServer(): Promise<void> {
-    if (getServerMode() !== "spawn") {
-      vscode.window.showInformationMessage("OpenCode: server is external; restart it yourself.")
-      return
+    const status = await this.server.start()
+    if (status.state === "ready") {
+      this.lastServerUrl = status.url
+      this.activeSource = "spawned"
+      await this.setLastServerUrl(status.url)
+      // Re-render the webview so CSP connect-src picks up the new origin
+      // and every existing SSE stream re-opens against the fresh server.
+      await this.reload()
     }
-    await this.server.start()
   }
 
   private async sendBootstrap() {
@@ -460,6 +503,15 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
       case "sseClose":
         this.proxySseClose((msg as Extract<WebviewRequest, { type: "sseClose" }>).id)
         return
+      case "webviewReady":
+        // Webview handshake — its `message` listener is now wired, so any
+        // bootstrap we may have posted during resolveWebviewView() before
+        // the iife finished loading was dropped by vscode-webview's async
+        // transport. Re-send now. Cheap and idempotent; the webview
+        // handles duplicate bootstraps by simply reinitialising.
+        this.output.appendLine(`[opencode-ext] webviewReady received — (re)sending bootstrap`)
+        void this.sendBootstrap()
+        return
       case "getDebug":
         this.view?.webview.postMessage({ type: "debugState", enabled: this.isDebugEnabled() })
         return
@@ -473,73 +525,63 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
         this.postServerConfig()
         return
       }
-      case "applyServerConfig": {
-        const req = msg as Extract<WebviewRequest, { type: "applyServerConfig" }>
-        void this.handleApplyServerConfig(req.mode, req.url)
+      case "attachToServer": {
+        const req = msg as Extract<WebviewRequest, { type: "attachToServer" }>
+        void this.handleAttachToServer(req.url)
         return
       }
     }
   }
 
   // -------------------------------------------------------------------
-  // External-server settings ("Settings → Server connection")
+  // Server connection settings ("Settings → Server connection")
   // -------------------------------------------------------------------
   //
-  // Replaces an earlier auto-scan implementation that turned out unreliable
-  // (webview↔host messages were racing with the reload cycle when the user
-  // clicked the button on a stale panel). The current design is dumber and
-  // more predictable: the user types a hostname + port, we validate, we
-  // write serverMode/serverUrl. `onDidChangeConfiguration("opencode")` in
-  // activate() picks up the write and triggers reload(), so the panel
-  // rebinds to the new URL automatically.
+  // On startup and on user "Attach", the extension prefers a specific URL
+  // and verifies it with identifyOpencode(). If verified, we record it as
+  // the remembered last-server URL (globalState) and use it. If it fails,
+  // we spawn a fresh local server and record that URL instead. This UI
+  // just lets the user pin a preferred URL — there is no spawn/external
+  // mode switch.
 
   private postServerConfig() {
-    const cfg = getConfig()
-    const mode = (cfg.get<string>("serverMode") ?? "spawn") as "spawn" | "external"
-    const url = cfg.get<string>("serverUrl") ?? "http://127.0.0.1:4096"
-    // Include the currently-spawned server URL when we have one. In spawn
-    // mode the actual bound port is derived at start-time (see ServerManager
-    // → preferredPort() → pickPort()) so it usually differs from the
-    // persisted `opencode.serverUrl`. The webview form prefills its
-    // hostname/port inputs from spawnUrl when available so "Attach to
-    // external server" targets the process this extension actually spawned,
-    // rather than the stale default the user last saved for external mode.
-    const spawnStatus = this.server.getStatus()
-    const spawnUrl =
-      spawnStatus.state === "ready" || spawnStatus.state === "starting"
-        ? spawnStatus.url
-        : this.lastServerUrl && mode === "spawn"
-          ? this.lastServerUrl
-          : undefined
     this.view?.webview.postMessage({
       type: "serverConfig",
-      mode,
-      url,
-      spawnUrl,
+      activeUrl: this.lastServerUrl,
+      activeSource: this.activeSource,
     } satisfies ExtensionMessage)
   }
 
-  private async handleApplyServerConfig(mode: "spawn" | "external", url: string | undefined) {
-    const cfg = getConfig()
-    try {
-      if (mode === "external") {
-        const clean = (url ?? "").trim().replace(/\/+$/, "")
-        if (!/^https?:\/\/[^\s]+:\d+$/.test(clean) && !/^https?:\/\/[^\s/:]+$/.test(clean)) {
-          vscode.window.showErrorMessage(`OpenCode: invalid server URL "${url}"`)
-          return
-        }
-        await cfg.update("serverMode", "external", vscode.ConfigurationTarget.Global)
-        await cfg.update("serverUrl", clean, vscode.ConfigurationTarget.Global)
-        this.output.appendLine(`[opencode-ext] switched to external server ${clean}`)
-        vscode.window.showInformationMessage(`OpenCode: attached to ${clean}`)
-      } else {
-        await cfg.update("serverMode", "spawn", vscode.ConfigurationTarget.Global)
-        this.output.appendLine(`[opencode-ext] switched to spawn mode`)
-        vscode.window.showInformationMessage(`OpenCode: reverted to spawn mode`)
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
-      vscode.window.showErrorMessage(`OpenCode: failed to update settings — ${message}`)
+  private async handleAttachToServer(url: string | undefined) {
+    const clean = (url ?? "").trim().replace(/\/+$/, "")
+    if (!/^https?:\/\/[^\s]+:\d+$/.test(clean) && !/^https?:\/\/[^\s/:]+$/.test(clean)) {
+      vscode.window.showErrorMessage(`OpenCode: invalid server URL "${url}"`)
+      return
+    }
+    // Same policy as startup: verify it's opencode, remember it, and reload.
+    // If not opencode, fall back to spawn (record the spawned URL instead).
+    this.output.appendLine(`[opencode-ext] attach requested: ${clean}`)
+    const identified = await identifyOpencode(clean)
+    if (identified) {
+      this.lastServerUrl = clean
+      this.activeSource = "reattached"
+      await this.setLastServerUrl(clean)
+      // Also seed ServerManager status so subsequent settings queries see
+      // the reattached URL and existing spawned children get dropped.
+      await this.server.ensureRunning(clean)
+      vscode.window.showInformationMessage(`OpenCode: attached to ${clean}`)
+      await this.reload()
+      return
+    }
+    vscode.window.showWarningMessage(
+      `OpenCode: could not verify opencode at ${clean}. Spawning a local server instead.`,
+    )
+    const status = await this.server.start()
+    if (status.state === "ready") {
+      this.lastServerUrl = status.url
+      this.activeSource = "spawned"
+      await this.setLastServerUrl(status.url)
+      await this.reload()
     }
   }
 

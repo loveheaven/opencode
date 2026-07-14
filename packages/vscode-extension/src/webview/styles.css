@@ -231,7 +231,72 @@ html, body, #app {
   width: 14px;
   text-align: center;
   opacity: 0.8;
+  flex: 0 0 auto;
 }
+
+/* File-type badge variant of the tool icon. Rendered for read/edit/write/
+ * apply_patch when we can extract a file extension from the tool input.
+ * A compact monospaced pill (2-4 chars) sits in place of the ✎ emoji so
+ * users can eyeball whether the model touched TS, MD, JSON, etc.
+ *
+ * Palette rules live below (.tool-icon-filetype-<key>). Each rule sets an
+ * `--filetype-color` custom prop that both the text and the pill border
+ * pick up, so new file types only need one colour declared. Defaults to a
+ * subdued grey when a class-specific rule isn't defined. */
+.tool-icon-filetype {
+  width: auto;
+  min-width: 26px;
+  padding: 1px 5px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  line-height: 1.4;
+  border-radius: 3px;
+  border: 1px solid color-mix(in srgb, var(--filetype-color, var(--vscode-descriptionForeground, #888)) 55%, transparent);
+  background: color-mix(in srgb, var(--filetype-color, var(--vscode-descriptionForeground, #888)) 15%, transparent);
+  color: var(--filetype-color, var(--vscode-descriptionForeground, #888));
+  opacity: 0.95;
+  text-transform: uppercase;
+}
+.tool-icon-filetype-ts       { --filetype-color: #3178c6; }
+.tool-icon-filetype-js       { --filetype-color: #f1c40f; }
+.tool-icon-filetype-py       { --filetype-color: #3572a5; }
+.tool-icon-filetype-rb       { --filetype-color: #cc342d; }
+.tool-icon-filetype-go       { --filetype-color: #00add8; }
+.tool-icon-filetype-rs       { --filetype-color: #dea584; }
+.tool-icon-filetype-java     { --filetype-color: #b07219; }
+.tool-icon-filetype-kotlin   { --filetype-color: #a97bff; }
+.tool-icon-filetype-swift    { --filetype-color: #f05138; }
+.tool-icon-filetype-c        { --filetype-color: #a8b9cc; }
+.tool-icon-filetype-cpp      { --filetype-color: #f34b7d; }
+.tool-icon-filetype-csharp   { --filetype-color: #178600; }
+.tool-icon-filetype-php      { --filetype-color: #4f5d95; }
+.tool-icon-filetype-md       { --filetype-color: #6a8fbf; }
+.tool-icon-filetype-json     { --filetype-color: #cbcb41; }
+.tool-icon-filetype-yaml     { --filetype-color: #cb171e; }
+.tool-icon-filetype-toml     { --filetype-color: #9c4221; }
+.tool-icon-filetype-xml      { --filetype-color: #005c9c; }
+.tool-icon-filetype-html     { --filetype-color: #e34c26; }
+.tool-icon-filetype-css      { --filetype-color: #563d7c; }
+.tool-icon-filetype-vue      { --filetype-color: #41b883; }
+.tool-icon-filetype-svelte   { --filetype-color: #ff3e00; }
+.tool-icon-filetype-sh       { --filetype-color: #89e051; }
+.tool-icon-filetype-sql      { --filetype-color: #dad8d8; }
+.tool-icon-filetype-gql      { --filetype-color: #e535ab; }
+.tool-icon-filetype-proto    { --filetype-color: #4285f4; }
+.tool-icon-filetype-docker   { --filetype-color: #384d54; }
+.tool-icon-filetype-make     { --filetype-color: #427819; }
+.tool-icon-filetype-git      { --filetype-color: #f05033; }
+.tool-icon-filetype-env      { --filetype-color: #ecd53f; }
+.tool-icon-filetype-npm      { --filetype-color: #cb3837; }
+.tool-icon-filetype-lock     { --filetype-color: #9a9a9a; }
+.tool-icon-filetype-txt      { --filetype-color: #a9a9a9; }
+.tool-icon-filetype-csv      { --filetype-color: #4caf50; }
+.tool-icon-filetype-image    { --filetype-color: #a074c4; }
+.tool-icon-filetype-pdf      { --filetype-color: #e74c3c; }
+.tool-icon-filetype-archive  { --filetype-color: #b58900; }
+.tool-icon-filetype-generic  { --filetype-color: var(--vscode-descriptionForeground, #888); }
 .tool-name {
   font-weight: 500;
   font-family: var(--vscode-editor-font-family, monospace);
@@ -246,10 +311,75 @@ html, body, #app {
   white-space: nowrap;
   flex: 1;
 }
+.tool-trailing {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
 .tool-status { font-size: 11px; opacity: 0.8; }
 .tool-status.running { color: var(--vscode-editorInfo-foreground); }
 .tool-status.completed { color: var(--vscode-charts-green, #2dbb7c); }
 .tool-status.error { color: var(--vscode-errorForeground); }
+
+/* Inline actions on the tool header (Copy / Open / Diff). Rendered in the
+ * trailing slot in place of the "done" status pill when the tool has
+ * completed, so users can hit the most common follow-ups without expanding
+ * the card. Styled as compact secondary buttons to match .diff-btn but
+ * scoped separately so hover feedback stays contained to the header. */
+.tool-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.tool-action-btn {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  border: 1px solid var(--vscode-button-border, transparent);
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+  cursor: pointer;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+.tool-action-btn:hover { background: var(--vscode-button-secondaryHoverBackground); }
+.tool-action-btn:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+.tool-action-btn.copied { color: var(--vscode-charts-green, #2dbb7c); }
+.tool-action-btn.copy-failed { color: var(--vscode-errorForeground); }
+
+/* Hover-only icon action (currently used for bash/shell Copy). Default is
+ * invisible + non-interactive so a shell command card stays visually quiet
+ * when the user is just skimming; the icon fades in when the pointer enters
+ * the surrounding .tool and fades back out when it leaves. Sized to match
+ * the header text height so it doesn't shift the layout on hover. */
+.tool-action-icon {
+  border: none;
+  background: transparent;
+  color: var(--vscode-descriptionForeground);
+  padding: 0 4px;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease-in-out;
+}
+.tool:hover .tool-action-icon,
+.tool-action-icon:focus-visible {
+  opacity: 0.8;
+  pointer-events: auto;
+}
+.tool-action-icon:hover { opacity: 1; color: var(--vscode-foreground); }
+.tool-action-icon:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+.tool-action-icon.copied { color: var(--vscode-charts-green, #2dbb7c); opacity: 1; }
+.tool-action-icon.copy-failed { color: var(--vscode-errorForeground); opacity: 1; }
 .tool-body {
   padding: 8px 10px;
   border-top: 1px solid var(--vscode-panel-border, transparent);
@@ -283,6 +413,181 @@ html, body, #app {
   cursor: pointer;
   text-decoration: underline;
 }
+
+/*
+ * Error card
+ *
+ * Rendered whenever opencode surfaces an APIError — either as a standalone
+ * bubble (session-level failure via showSessionError) or attached to an
+ * assistant message that errored out mid-stream. Replaces the old
+ * "dump the whole JSON into a <pre>" approach with a categorised summary
+ * plus a folded raw payload for support / debugging.
+ *
+ * Left border colour tracks the error kind so users can spot the category
+ * without reading the title. Palette picks warning-ish neutral colours so
+ * the card doesn't scream red for benign categories (rate limit, context
+ * overflow — both usually a config tweak away from working).
+ */
+.error-card {
+  border-left: 3px solid var(--vscode-errorForeground, #f14c4c);
+}
+.error-card-context     { border-left-color: var(--vscode-notificationsWarningIcon-foreground, #cca700); }
+.error-card-rate-limit  { border-left-color: var(--vscode-notificationsWarningIcon-foreground, #cca700); }
+.error-card-auth        { border-left-color: var(--vscode-errorForeground, #f14c4c); }
+.error-card-upstream    { border-left-color: var(--vscode-charts-orange, #d18616); }
+.error-card-network     { border-left-color: var(--vscode-charts-blue, #3794ff); }
+.error-card-generic     { border-left-color: var(--vscode-errorForeground, #f14c4c); }
+
+.error-card-header { cursor: default; }
+.error-card-header:hover { filter: none; }
+
+/* Reset the collapsible tool-body defaults: errors always show fully. */
+.error-card-body {
+  max-height: none;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  white-space: normal;
+  font-family: var(--vscode-font-family);
+  font-size: 12px;
+}
+
+.error-card-summary {
+  color: var(--vscode-foreground);
+  line-height: 1.5;
+  font-size: 13px;
+}
+
+.error-card-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.error-card-fact {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--vscode-foreground) 15%, transparent);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.error-card-fact-key { opacity: 0.7; }
+.error-card-fact-val {
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-weight: 600;
+}
+
+.error-card-advice {
+  display: flex;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--vscode-textLink-foreground, #3794ff) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--vscode-textLink-foreground, #3794ff) 25%, transparent);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.error-card-advice-icon { flex: 0 0 auto; }
+
+/* Action row below the advice line. Buttons let users perform the most
+ * likely fix without leaving the chat panel (currently: compact the
+ * session, start a new one — both scoped to context-overflow errors). */
+.error-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+.error-card-action {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 12px;
+  border-radius: 3px;
+  border: 1px solid var(--vscode-button-border, transparent);
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+  cursor: pointer;
+  line-height: 1.3;
+}
+.error-card-action:hover:not(:disabled) { background: var(--vscode-button-secondaryHoverBackground); }
+.error-card-action.primary {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+  border-color: transparent;
+}
+.error-card-action.primary:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
+.error-card-action:disabled { opacity: 0.65; cursor: default; }
+.error-card-action.done {
+  background: color-mix(in srgb, var(--vscode-charts-green, #23d18b) 20%, transparent);
+  color: var(--vscode-charts-green, #23d18b);
+  border-color: color-mix(in srgb, var(--vscode-charts-green, #23d18b) 40%, transparent);
+}
+
+/* Wrapper around the button row + inline hint. The hint appears below
+ * the buttons after the user clicks Compact, explaining that a second
+ * error card will show up if the auto-retry also fails. */
+.error-card-actions-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.error-card-inline-hint {
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 6px 8px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--vscode-notificationsWarningIcon-foreground, #cca700) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--vscode-notificationsWarningIcon-foreground, #cca700) 30%, transparent);
+  color: var(--vscode-foreground);
+  opacity: 0.9;
+}
+
+.error-card-details {
+  border-top: 1px dashed color-mix(in srgb, var(--vscode-foreground) 15%, transparent);
+  padding-top: 8px;
+  position: relative;
+}
+.error-card-details > summary {
+  cursor: pointer;
+  font-size: 11px;
+  opacity: 0.7;
+  user-select: none;
+  list-style: revert;
+}
+.error-card-details > summary:hover { opacity: 1; }
+.error-card-raw {
+  margin: 6px 0 0 0;
+  padding: 8px 10px;
+  background: var(--vscode-textCodeBlock-background, rgba(120,120,120,0.1));
+  border-radius: 3px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.error-card-copy {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  border: 1px solid var(--vscode-button-border, transparent);
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.error-card-details:hover .error-card-copy,
+.error-card-details[open] .error-card-copy { opacity: 1; }
+.error-card-copy:hover { background: var(--vscode-button-secondaryHoverBackground); }
 
 /*
  * Slash command palette: appears above the textarea when the user starts

@@ -33,7 +33,7 @@ export class ServerManager implements vscode.Disposable {
     return this.status.state === "ready" || this.status.state === "starting" ? this.status.url : undefined
   }
 
-  async ensureRunning(): Promise<ServerStatus> {
+  async ensureRunning(preferredUrl?: string): Promise<ServerStatus> {
     if (this.status.state === "ready") return this.status
     if (this.status.state === "starting") {
       const url = this.status.url
@@ -41,10 +41,30 @@ export class ServerManager implements vscode.Disposable {
       this.setStatus(ready ? { state: "ready", url } : { state: "error", message: `Server did not become ready at ${url}` })
       return this.status
     }
-    return this.start()
+    return this.start(preferredUrl)
   }
 
-  async start(): Promise<ServerStatus> {
+  // If `preferredUrl` is given and something already-live at that URL answers
+  // like an opencode server, we skip spawning entirely and record it as ready.
+  // This is the mechanism behind "next start reattaches to the last URL":
+  // extension.ts hands us the previously-connected URL, we probe it here,
+  // and only fall through to spawning if it's gone (or not opencode).
+  async start(preferredUrl?: string): Promise<ServerStatus> {
+    if (preferredUrl) {
+      const identified = await identifyOpencode(preferredUrl)
+      if (identified) {
+        this.output.appendLine(`[opencode-ext] reusing existing opencode server at ${preferredUrl}`)
+        // Any child we might have had from a prior session is unrelated —
+        // don't kill it; but we do drop our handle so restart() spawns fresh
+        // if the user later asks for one.
+        this.proc = undefined
+        this.stopping = false
+        this.setStatus({ state: "ready", url: preferredUrl })
+        return this.status
+      }
+      this.output.appendLine(`[opencode-ext] ${preferredUrl} did not identify as opencode; spawning fresh`)
+    }
+
     await this.stop()
 
     // Prefer a deterministic port derived from the current workspace path.
@@ -117,17 +137,17 @@ export class ServerManager implements vscode.Disposable {
     child.on("error", (error) => {
       const enoent = (error as NodeJS.ErrnoException).code === "ENOENT"
       const detail = enoent
-        ? `${launcher.command} not found. ${launcher.mode === "opencode-cli" ? "Install opencode (npm i -g opencode) or set opencode.serverMode=spawn-source with a repo checkout." : "Install bun (https://bun.sh) or set opencode.bunPath."}`
+        ? `${launcher.command} not found. ${launcher.mode === "opencode-cli" ? "Install opencode (npm i -g opencode) or set opencode.launcher=source with a repo checkout." : "Install bun (https://bun.sh) or set opencode.bunPath."}`
         : error.message
       this.output.appendLine(`[opencode-ext] spawn error: ${detail}`)
       this.setStatus({ state: "error", message: `Server process error: ${detail}` })
     })
 
-    const ready = await waitForReady(url, 30000)
+    const ready = await waitForReady(url, 45000)
     if (ready) {
       this.setStatus({ state: "ready", url })
     } else if (this.status.state !== "error") {
-      this.setStatus({ state: "error", message: `Server did not become ready at ${url} within 30s` })
+      this.setStatus({ state: "error", message: `Server did not become ready at ${url} within 45s` })
     }
     return this.status
   }
@@ -161,16 +181,45 @@ export class ServerManager implements vscode.Disposable {
   }
 
   dispose(): void {
-    // dispose() runs during extension deactivation. We can't await here, but we
-    // must at least send the kill signal synchronously so the OS reaps the tree
-    // even if the extension host exits before the async settle completes.
+    // dispose() runs during extension host teardown — which fires on
+    // BOTH real deactivation (user closed VSCode / disabled the extension)
+    // AND window reload (Ctrl+R / "Developer: Reload Window"). We can't
+    // tell the two apart from here, so the strategy has to work for both.
+    //
+    // Historically we SIGTERM'd the whole process tree here. That was fine
+    // for "close VSCode" but disastrous for reload: the new extension host
+    // would come up, ask identifyOpencode(lastUrl) → the server we just
+    // killed no longer answers → fallback to spawning a fresh one → the
+    // user has to re-attach every reload and any in-flight session state
+    // (webview cache, warmed-up connections) is thrown away.
+    //
+    // Now we deliberately DON'T kill the child on dispose. The rationale:
+    //   • `detached: true` puts the child in its own process group so it
+    //     survives our exit without becoming a zombie.
+    //   • On the next start(), reapStrayServersOnPort() will detect any
+    //     stale server holding this workspace's preferred port and clean
+    //     it up before spawning fresh. That covers the true deactivation
+    //     case where the surviving process would otherwise leak.
+    //   • The reload case now short-circuits: new host → identifyOpencode
+    //     succeeds → reattach → user's UI is instantly back on the same
+    //     session.
+    //
+    // User-initiated cleanup paths (opencode.restartServer, stop()) still
+    // send SIGTERM through killTree; only the implicit teardown route is
+    // relaxed.
     const child = this.proc
     if (child) {
-      const pid = child.pid
-      this.output.appendLine(`[opencode-ext] dispose: killing server tree pid=${pid ?? "?"}`)
-      killTree(pid, "SIGTERM", this.output)
-      // Give it a beat then hard-kill as a fallback.
-      setTimeout(() => killTree(pid, "SIGKILL", this.output), 500).unref()
+      this.output.appendLine(
+        `[opencode-ext] dispose: leaving server pid=${child.pid ?? "?"} running so window reload can reattach; stale servers are reaped on next spawn`,
+      )
+      // Detach the child from our reference AND from Node's internal
+      // handle-tracking. Without unref() Node keeps a handle to the
+      // detached child's stdio pipes and the extension host process
+      // wouldn't be able to exit cleanly. `stdio` was ["ignore","pipe",
+      // "pipe"] at spawn time, so there's a stdout/stderr pipe to release.
+      try { child.stdout?.destroy() } catch { /* ignore */ }
+      try { child.stderr?.destroy() } catch { /* ignore */ }
+      try { child.unref() } catch { /* ignore */ }
     }
     this.proc = undefined
     this.emitter.dispose()
@@ -444,6 +493,77 @@ function waitForReady(url: string, timeoutMs: number): Promise<boolean> {
       })
     }
     attempt()
+  })
+}
+
+// Positive identification: is the server at `url` an opencode server (as
+// opposed to some other HTTP service that happens to have taken over the
+// port after a crash / user reboot / etc.)? Used before we agree to attach
+// to a previously-remembered URL on startup.
+//
+// Strategy: GET /doc — opencode serves its OpenAPI spec there (see
+// packages/opencode/src/server/routes/instance/httpapi/server.ts, docRoute).
+// A response whose body contains the "opencode" string is treated as ours.
+// If the endpoint doesn't answer, or the body doesn't look like opencode's
+// spec, we return false so the caller falls back to spawning fresh.
+export function identifyOpencode(url: string, timeoutMs = 2000): Promise<boolean> {
+  return new Promise((resolve) => {
+    let parsed: URL
+    try {
+      parsed = new URL(url)
+    } catch {
+      resolve(false)
+      return
+    }
+    const req = http.request(
+      {
+        method: "GET",
+        hostname: parsed.hostname,
+        port: parsed.port || 80,
+        path: "/doc",
+        timeout: timeoutMs,
+      },
+      (res) => {
+        // /doc is an authenticated route; without a session cookie it may
+        // return 401/403. Any of those still tells us "this is opencode",
+        // because the endpoint exists — we just aren't authorised. A
+        // random HTTP service on the port wouldn't respond on /doc at all
+        // (it would 404, or return content that doesn't mention opencode).
+        // So we accept 2xx bodies that mention opencode, and treat 401/403
+        // as a positive match without reading the body.
+        const status = res.statusCode ?? 0
+        if (status === 401 || status === 403) {
+          res.resume()
+          resolve(true)
+          return
+        }
+        if (status < 200 || status >= 300) {
+          res.resume()
+          resolve(false)
+          return
+        }
+        let received = 0
+        const cap = 64 * 1024
+        const chunks: Buffer[] = []
+        res.on("data", (chunk: Buffer) => {
+          if (received >= cap) return
+          const remaining = cap - received
+          chunks.push(remaining >= chunk.length ? chunk : chunk.subarray(0, remaining))
+          received += Math.min(chunk.length, remaining)
+        })
+        res.on("end", () => {
+          const body = Buffer.concat(chunks).toString("utf8").toLowerCase()
+          resolve(body.includes("opencode"))
+        })
+        res.on("error", () => resolve(false))
+      },
+    )
+    req.on("timeout", () => {
+      req.destroy()
+      resolve(false)
+    })
+    req.on("error", () => resolve(false))
+    req.end()
   })
 }
 

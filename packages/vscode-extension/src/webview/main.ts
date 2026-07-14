@@ -135,6 +135,7 @@ function setup() {
   initMessagesView({
     renderQuestions,
     postMessage: (m) => vscode.postMessage(m),
+    onNewSession: () => newSession(),
   })
   initQuestions({ scrollToBottom })
   initEvents({
@@ -215,13 +216,30 @@ function setup() {
   window.addEventListener("message", onExtensionMessage)
   setStatus("Waiting for opencode server…")
 
+  // Handshake: tell the host we're ready to receive messages. Under
+  // remote-ssh / dev-containers the vscode-webview transport is async, so
+  // any `webview.postMessage(...)` the host fires *before* this listener
+  // is registered gets dropped. That was the actual cause of the sticky
+  // "Waiting for opencode server…" state after Reload Window: the server
+  // was already reattached in <1s, but the host's bootstrap message was
+  // sent before this iife had wired its `message` listener, so we never
+  // saw it. Host replies to `webviewReady` by re-sending bootstrap.
+  vscode.postMessage({ type: "webviewReady" })
+
   // If bootstrap never arrives, surface it instead of leaving a blank panel.
+  //
+  // Budget notes (worst case, cold Reload Window):
+  //   • identifyOpencode(lastUrl) 2s
+  //   • ServerManager.start → spawn + waitForReady up to 45s
+  //   • host bootstrap post-message + webview handling: sub-second
+  // Total worst case ≈ 48s. We give it 60s so a slow bun cold start
+  // or a filesystem hiccup during reap doesn't trip the message.
   setTimeout(() => {
     if (!getClient()) {
       setStatus("Server not ready. Run “OpenCode: Restart Server” from the command palette.")
       renderEmptyState()
     }
-  }, 15000)
+  }, 60000)
 }
 
 async function onExtensionMessage(event: MessageEvent) {
@@ -301,10 +319,11 @@ async function onExtensionMessage(event: MessageEvent) {
       applyDebugState(Boolean(msg.enabled))
       return
     case "serverConfig": {
-      const mode = (msg.mode as string) === "external" ? "external" : "spawn"
-      const url = typeof msg.url === "string" ? (msg.url as string) : "http://127.0.0.1:4096"
-      const spawnUrl = typeof msg.spawnUrl === "string" ? (msg.spawnUrl as string) : undefined
-      applyServerConfig(mode, url, spawnUrl)
+      const activeUrl = typeof msg.activeUrl === "string" ? (msg.activeUrl as string) : undefined
+      const rawSource = typeof msg.activeSource === "string" ? (msg.activeSource as string) : undefined
+      const activeSource: "spawned" | "reattached" | "external" | undefined =
+        rawSource === "spawned" || rawSource === "reattached" || rawSource === "external" ? rawSource : undefined
+      applyServerConfig(activeUrl, activeSource)
       return
     }
   }
