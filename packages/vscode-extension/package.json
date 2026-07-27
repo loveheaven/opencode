@@ -2,7 +2,7 @@
   "name": "opencode-vscode",
   "displayName": "OpenCode",
   "description": "OpenCode chat inside VSCode. Talks to a local opencode server over its HTTP API.",
-  "version": "0.26.18",
+  "version": "0.26.24",
   "private": true,
   "publisher": "opencode-ai",
   "engines": {

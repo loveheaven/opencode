@@ -41,6 +41,7 @@ import {
 import {
   firstProviderModel,
   initAgentModel,
+  isUserSelectableAgent,
   renderAgentModel,
 } from "./agent-model"
 import {
@@ -49,6 +50,7 @@ import {
   recordMessage,
   renderAllMessages,
   renderEmptyState,
+  renderIncremental,
   scrollToBottom,
 } from "./messages-view"
 import { initQuestions, renderQuestions } from "./questions"
@@ -137,7 +139,7 @@ function setup() {
     postMessage: (m) => vscode.postMessage(m),
     onNewSession: () => newSession(),
   })
-  initQuestions({ scrollToBottom })
+  initQuestions({ scrollToBottom, rerenderMessage: renderIncremental })
   initEvents({
     updateSessionLabel,
     onCurrentSessionDeleted: () => newSession(),
@@ -391,7 +393,12 @@ async function loadAgentsAndProviders() {
 
   const persistedAgent = persisted.getAgent(state.directory)
   const persistedModel = persisted.getModel(state.directory)
-  state.agent = persistedAgent || state.defaultAgent || state.agents[0]?.name || "build"
+  // Fallback chain when nothing was persisted and the server didn't tell us
+  // a defaultAgent: pick the first USER-SELECTABLE agent (skip hidden ones
+  // like compaction/title/summary and subagent-only ones like general/
+  // explore). Ultimate fallback is "build" which is always primary.
+  const firstUsableAgent = state.agents.find(isUserSelectableAgent)?.name
+  state.agent = persistedAgent || state.defaultAgent || firstUsableAgent || "build"
   state.model = persistedModel || state.defaultModel || firstProviderModel(state.providers) || ""
   renderAgentModel()
 }

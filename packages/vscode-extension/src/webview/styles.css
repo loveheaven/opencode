@@ -838,6 +838,99 @@ body.opencode-dragging * {
 }
 .msg.user .user-text { white-space: pre-wrap; word-wrap: break-word; }
 
+/*
+ * Compaction chip
+ *
+ * opencode's auto-compaction feature interrupts the normal turn stream to
+ * generate a conversation summary — that summary is stored as an assistant
+ * message with agent="compaction", and it comes paired with a user-side
+ * marker message. Rendering both inline splits the actual conversation
+ * with a wall of summary text; we fold each of those messages into a
+ * single collapsed chip so users can still inspect the summary when they
+ * want, but the visual flow of the conversation stays clean.
+ *
+ * The chip is intentionally quieter than a regular bubble: no
+ * "assistant · model" meta row, no token badge, no left-aligned avatar
+ * space. It reads as a horizontal system-log line, similar to git commit
+ * summaries in a diff view.
+ */
+.msg.compaction {
+  align-self: stretch;
+  margin: 4px 0;
+}
+.compaction-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 4px;
+  border: 1px dashed color-mix(in srgb, var(--vscode-foreground) 20%, transparent);
+  background: color-mix(in srgb, var(--vscode-foreground) 4%, transparent);
+  color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+  font-size: 11px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 120ms ease;
+}
+.compaction-chip:hover {
+  background: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
+}
+.compaction-chip:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+.compaction-chip-arrow {
+  font-size: 10px;
+  opacity: 0.7;
+  width: 12px;
+  text-align: center;
+  flex: 0 0 auto;
+}
+.compaction-chip-icon {
+  flex: 0 0 auto;
+  opacity: 0.85;
+}
+.compaction-chip-label {
+  flex: 1 1 auto;
+  font-weight: 500;
+  color: var(--vscode-foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.compaction-chip-hint {
+  flex: 0 0 auto;
+  opacity: 0.7;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-variant-numeric: tabular-nums;
+}
+.compaction-body {
+  margin-top: 4px;
+  padding: 8px 10px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--vscode-foreground) 3%, transparent);
+  border-left: 2px solid color-mix(in srgb, var(--vscode-foreground) 20%, transparent);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.compaction-body-kv {
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  opacity: 0.75;
+  margin-bottom: 6px;
+}
+.compaction-body-text {
+  margin: 0;
+  font-family: var(--vscode-font-family);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  max-height: 320px;
+  overflow-y: auto;
+  color: var(--vscode-foreground);
+  opacity: 0.9;
+}
+
 /* Collapsed slash-command bubble: header shows `/name` + a Show-details
  * toggle, body (the full server-expanded template) hides behind the toggle.
  * Keeps the message list scannable when opencode's server injects hundreds
@@ -1660,6 +1753,48 @@ button.ghost:hover { background: var(--vscode-toolbar-hoverBackground); }
 .question-btn:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+/* Read-only variant of the question card, used when rendering an already-
+ * answered `question` tool call in message history. Same DOM shape as the
+ * pending card (deliberately — users asked for the same visual), just
+ * toned down so it doesn't compete with active UI:
+ *   • softer border colour (no focus accent);
+ *   • picked options get a subtle background so the previous answer
+ *     stands out at a glance;
+ *   • disabled inputs keep their vscode look but with the pointer cursor
+ *     removed so hovering doesn't imply interactivity.
+ */
+.question-card.answered {
+  border-color: var(--vscode-panel-border, transparent);
+  border-left-color: var(--vscode-textLink-foreground);
+}
+.question-card.answered .question-header {
+  color: var(--vscode-descriptionForeground);
+}
+.question-card.answered .question-option {
+  cursor: default;
+}
+.question-card.answered .question-option.picked {
+  background: var(--vscode-inputValidation-infoBackground, var(--vscode-editorInlayHint-background, transparent));
+}
+.question-card.answered .question-option:not(.picked) {
+  opacity: 0.7;
+}
+.question-card.answered .question-option input[disabled] {
+  cursor: default;
+  opacity: 1;
+}
+.question-card.answered .question-custom[disabled] {
+  opacity: 1;
+  color: var(--vscode-foreground);
+  cursor: default;
+}
+.question-card.answered .question-empty {
+  font-size: 12px;
+  font-style: italic;
+  color: var(--vscode-descriptionForeground);
+  padding: 2px 6px;
 }
 
 /* highlight.js themes.
