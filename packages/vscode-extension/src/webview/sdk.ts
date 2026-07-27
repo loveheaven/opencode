@@ -127,6 +127,14 @@ export type AssistantMessage = {
   error?: { name: string; message?: string; [key: string]: unknown }
   cost?: number
   tokens?: TokenUsage
+  // Set to `true` by the server on assistant messages that carry a
+  // conversation-history summary (auto-compaction and manual /compact
+  // both hit this path — see session/compaction.ts line 364). The
+  // webview folds these into a compact card so the summary text doesn't
+  // interrupt the normal turn stream. `mode` mirrors the same signal
+  // ("compaction") on the underlying message record.
+  summary?: boolean
+  mode?: string
 }
 
 export type Message = UserMessage | AssistantMessage
@@ -178,6 +186,16 @@ export type AgentInfo = {
   name: string
   description?: string
   builtIn?: boolean
+  // Server exposes `mode` (primary | subagent | all) and `hidden` on every
+  // agent — see packages/opencode/src/agent/agent.ts. The webview's agent
+  // picker should hide anything that isn't user-selectable:
+  //   • mode === "subagent"  — only invocable through the `task` tool
+  //     (e.g. `general`, `explore`); the LLM picks it, not the user.
+  //   • hidden === true      — internal-only utility agents like
+  //     `compaction`, `title`, `summary` used by the server itself.
+  // Legacy servers may omit these fields, so treat undefined as "visible".
+  mode?: "primary" | "subagent" | "all"
+  hidden?: boolean
 }
 
 export type CommandInfo = {

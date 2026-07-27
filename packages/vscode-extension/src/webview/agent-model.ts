@@ -10,7 +10,7 @@
 // helper); we call back into it through injected setters so this module
 // doesn't need to know about VSCode webview state APIs.
 
-import type { ProviderInfo } from "./sdk"
+import type { AgentInfo, ProviderInfo } from "./sdk"
 import { openSettings } from "./settings"
 import { refs, state } from "./shared"
 
@@ -105,9 +105,21 @@ function pillButton(label: string, title: string, onClick: () => void): HTMLButt
 }
 
 function showAgentMenu(anchor: HTMLElement) {
+  // Server returns EVERY agent it knows about, including three categories
+  // the user must not pick from the menu:
+  //   • hidden === true — internal utility agents (compaction/title/summary)
+  //     used by the server itself; picking one as your session's agent would
+  //     leave the session unable to do anything useful.
+  //   • mode === "subagent" — only reachable via the `task` tool
+  //     (general/explore); the LLM picks these, not the user.
+  // Anything with mode === "primary" or "all" (or missing on legacy servers)
+  // is a valid session-level agent.
+  const items = state.agents
+    .filter(isUserSelectableAgent)
+    .map((a) => ({ label: a.name, value: a.name, title: a.description }))
   showPopupMenu(
     anchor,
-    state.agents.map((a) => ({ label: a.name, value: a.name })),
+    items,
     (val) => {
       state.agent = val
       persisted?.setAgent(state.directory, val)
@@ -115,6 +127,12 @@ function showAgentMenu(anchor: HTMLElement) {
     },
     state.agent,
   )
+}
+
+export function isUserSelectableAgent(a: AgentInfo): boolean {
+  if (a.hidden === true) return false
+  if (a.mode === "subagent") return false
+  return true
 }
 
 function showModelMenu(anchor: HTMLElement) {
@@ -153,7 +171,7 @@ function showModelMenu(anchor: HTMLElement) {
 type MenuAction = { label: string; run: () => void }
 function showPopupMenu(
   anchor: HTMLElement,
-  items: { label: string; value: string }[],
+  items: { label: string; value: string; title?: string }[],
   onPick: (value: string) => void,
   selectedValue?: string,
   actions?: MenuAction[],
@@ -192,7 +210,7 @@ function showPopupMenu(
   const makeRow = (
     text: string,
     onClick: () => void,
-    opts: { checked?: boolean; muted?: boolean } = {},
+    opts: { checked?: boolean; muted?: boolean; title?: string } = {},
   ) => {
     const el = document.createElement("div")
     Object.assign(el.style, {
@@ -219,6 +237,7 @@ function showPopupMenu(
     const label = document.createElement("span")
     label.textContent = text
     el.appendChild(label)
+    if (opts.title) el.title = opts.title
     el.addEventListener("mouseenter", () => (el.style.background = "var(--vscode-menu-selectionBackground, var(--vscode-list-hoverBackground))"))
     el.addEventListener("mouseleave", () => (el.style.background = "transparent"))
     el.addEventListener("click", () => {
@@ -234,7 +253,10 @@ function showPopupMenu(
     ? [...items].sort((a, b) => (a.value === selectedValue ? -1 : b.value === selectedValue ? 1 : 0))
     : items
   for (const item of sorted) {
-    makeRow(item.label, () => onPick(item.value), { checked: item.value === selectedValue })
+    makeRow(item.label, () => onPick(item.value), {
+      checked: item.value === selectedValue,
+      title: item.title,
+    })
   }
   if (items.length === 0) {
     const el = document.createElement("div")

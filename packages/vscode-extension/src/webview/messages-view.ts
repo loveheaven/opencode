@@ -13,13 +13,16 @@
 // The module reads shared.state directly (message maps live there) and
 // writes into shared.refs.messages / shared.refs.sessionUsage. Two
 // injected callbacks connect it to sibling modules: `renderQuestions()`
-// keeps question cards pinned to the bottom of the list, and `postMessage`
-// forwards path/diff clicks to the extension host.
+// requests re-rendering of assistant bubbles that own a pending
+// question (the interactive card is drawn on the tool part itself —
+// see buildQuestionCard in questions.ts), and `postMessage` forwards
+// path/diff clicks to the extension host.
 
 import { escapeHtml, renderMarkdown } from "./markdown"
 import type { Message, MessageWithParts, Part, TokenUsage, ToolPart } from "./sdk"
 import { getClient, refs, state, type MessageEntry } from "./shared"
 import { openLightbox } from "./lightbox"
+import { buildQuestionCard, clearQuestionDraft, findPendingQuestionForTool } from "./questions"
 
 let renderQuestionsCb: () => void = () => {}
 let postMessage: (msg: unknown) => void = () => {}
@@ -107,6 +110,7 @@ export function clearMessagesRender() {
   state.messages.clear()
   state.messageOrder.length = 0
   orphanParts.length = 0
+  openCompactions.clear()
   refs.messages.innerHTML = ""
 }
 
@@ -678,11 +682,11 @@ export function renderIncremental(messageID: string) {
     else {
       const empty = refs.messages.querySelector(".empty")
       empty?.remove()
-      // Keep question cards pinned to the bottom by inserting new messages
-      // before the first pending question card, if any.
-      const firstQuestion = refs.messages.querySelector(".question-card")
-      if (firstQuestion) refs.messages.insertBefore(replacement, firstQuestion)
-      else refs.messages.appendChild(replacement)
+      // Plan B (see questions.ts): pending question cards live INSIDE
+      // the assistant bubble on the running `question` tool part, not
+      // as free-floating children of refs.messages. So new messages
+      // just append at the end — nothing to pin around.
+      refs.messages.appendChild(replacement)
     }
     // When this message now carries an error, drop any standalone session-
     // error bubble that showSessionError() may have added earlier: the SSE
@@ -712,6 +716,20 @@ export function removeMessageFromDom(messageID: string) {
 }
 
 function renderMessage(entry: MessageEntry): HTMLElement | null {
+  // Short-circuit compaction turns into a single collapsed card. Server-
+  // side compaction fires TWO messages into the stream:
+  //   • a user message carrying a `type: "compaction"` marker part (empty
+  //     otherwise — this is just the "please compact" trigger);
+  //   • an assistant message with `agent: "compaction"` + `summary: true`,
+  //     containing the summary text produced by the compaction model.
+  // Rendering these inline splits the user's actual conversation into
+  // "your turn → compaction trigger card → compaction summary bubble →
+  // model's continuation" with a wall of summary text in the middle. Fold
+  // both into a single compact chip that expands on click. See
+  // `packages/opencode/src/session/compaction.ts` lines ~360 for the
+  // producing side.
+  if (isCompactionMessage(entry)) return renderCompactionMessage(entry)
+
   const bubble = document.createElement("div")
   bubble.className = "bubble prose"
 
@@ -746,7 +764,7 @@ function renderMessage(entry: MessageEntry): HTMLElement | null {
         // Skip server-synthesised file parts too — those come from Read tool
         // expansion, not from the user, and render as noisy duplicates.
         if ((part as { synthetic?: boolean }).synthetic) continue
-        const el = renderPart(part)
+        const el = renderPart(part, entry.info.id)
         if (el) {
           bubble.appendChild(el)
           fileCount++
@@ -780,7 +798,7 @@ function renderMessage(entry: MessageEntry): HTMLElement | null {
     for (const pid of entry.partOrder) {
       const part = entry.parts.get(pid)
       if (!part) continue
-      const el = renderPart(part)
+      const el = renderPart(part, entry.info.id)
       if (el) bubble.appendChild(el)
       if (part.type === "text") {
         const tp = part as { text?: string; synthetic?: boolean }
@@ -1034,7 +1052,184 @@ function agentLabel(info: Message): string {
   return agent || model || "assistant"
 }
 
-function renderPart(part: Part): HTMLElement | null {
+// Which compaction messages the user has opened. renderIncremental() runs
+// on every part.updated during streaming and calls `el.replaceWith(new)`;
+// without this memo the user's click to expand would be undone the next
+// time a text chunk arrives. Keyed by message id so both the user marker
+// and the assistant summary keep their own state.
+const openCompactions = new Set<string>()
+
+// A message belongs to a compaction turn when either
+//   (a) it's the assistant summary itself (agent="compaction" or
+//       summary=true — the server sets both), OR
+//   (b) it's the user marker message whose only meaningful part is the
+//       `type: "compaction"` marker (empty otherwise; carries `auto`
+//       and `overflow` metadata for context, but nothing to render).
+// Regular user messages that happen to sit right next to a compaction
+// pass are not folded — we only touch the ones opencode itself synthesised.
+function isCompactionMessage(entry: MessageEntry): boolean {
+  const info = entry.info
+  if (info.role === "assistant") {
+    const a = info as { agent?: string; summary?: boolean; mode?: string }
+    return a.agent === "compaction" || a.summary === true || a.mode === "compaction"
+  }
+  // user message: has a compaction marker part and no non-marker text.
+  let hasMarker = false
+  let hasOtherContent = false
+  for (const pid of entry.partOrder) {
+    const p = entry.parts.get(pid)
+    if (!p) continue
+    if (p.type === "compaction") {
+      hasMarker = true
+      continue
+    }
+    // A user message that happens to carry text alongside a compaction
+    // marker (currently impossible on the server side, but be defensive)
+    // is treated as a normal user message so we don't hide user text.
+    if (p.type === "text") {
+      const tp = p as { text?: string; synthetic?: boolean }
+      if (tp.text && !tp.synthetic) hasOtherContent = true
+    } else if (p.type === "file") {
+      hasOtherContent = true
+    }
+  }
+  return hasMarker && !hasOtherContent
+}
+
+// Render a collapsed chip for a compaction turn. Layout:
+//   ▸ 📎 Compacted conversation history                (auto · 12 turns)
+// Clicking toggles a body that shows the marker metadata (for user marker
+// messages) or the summary text (for assistant summary messages) so users
+// can still inspect what was compacted if they need to.
+function renderCompactionMessage(entry: MessageEntry): HTMLElement | null {
+  const info = entry.info
+  const isAssistant = info.role === "assistant"
+
+  // Gather visible content. For assistant summaries we take all
+  // text/reasoning parts. For user markers we extract the auto/overflow
+  // metadata into a small kv block.
+  const summaryText: string[] = []
+  const kvLines: string[] = []
+  for (const pid of entry.partOrder) {
+    const p = entry.parts.get(pid)
+    if (!p) continue
+    if (p.type === "text") {
+      const tp = p as { text?: string; synthetic?: boolean }
+      if (tp.text && !tp.synthetic) summaryText.push(tp.text)
+    } else if (p.type === "reasoning") {
+      const rp = p as { text?: string }
+      if (rp.text) summaryText.push(rp.text)
+    } else if (p.type === "compaction") {
+      const cp = p as { auto?: boolean; overflow?: boolean; tail_start_id?: string }
+      if (cp.auto !== undefined) kvLines.push(`auto: ${cp.auto}`)
+      if (cp.overflow !== undefined) kvLines.push(`overflow: ${cp.overflow}`)
+      if (cp.tail_start_id) kvLines.push(`tail_start_id: ${cp.tail_start_id}`)
+    }
+  }
+
+  // Nothing to show at all → drop the message entirely rather than leave
+  // a bare "▸ Compacted history" chip with an empty body.
+  if (summaryText.length === 0 && kvLines.length === 0) return null
+
+  const wrap = document.createElement("div")
+  // Use a distinct class so styles.css can style the chip lighter than a
+  // regular assistant bubble; the meta row is intentionally omitted (no
+  // "assistant · model" label, no token badge) to keep it visually quiet.
+  wrap.className = "msg compaction"
+  wrap.dataset.messageId = info.id
+
+  const chip = document.createElement("div")
+  chip.className = "compaction-chip"
+  chip.setAttribute("role", "button")
+  chip.tabIndex = 0
+
+  const arrow = document.createElement("span")
+  arrow.className = "compaction-chip-arrow"
+  arrow.textContent = "▸"
+  chip.appendChild(arrow)
+
+  const icon = document.createElement("span")
+  icon.className = "compaction-chip-icon"
+  icon.textContent = "📎"
+  chip.appendChild(icon)
+
+  const label = document.createElement("span")
+  label.className = "compaction-chip-label"
+  label.textContent = isAssistant ? "Compacted conversation history" : "Compaction triggered"
+  chip.appendChild(label)
+
+  // Optional short hint on the right. For the user marker we surface the
+  // auto/overflow flags concisely so users can eyeball WHY compaction ran
+  // without expanding the body.
+  const hintBits: string[] = []
+  if (!isAssistant) {
+    for (const pid of entry.partOrder) {
+      const p = entry.parts.get(pid)
+      if (p?.type === "compaction") {
+        const cp = p as { auto?: boolean; overflow?: boolean }
+        if (cp.overflow) hintBits.push("overflow")
+        else if (cp.auto) hintBits.push("auto")
+        else hintBits.push("manual")
+        break
+      }
+    }
+  } else if (summaryText.length > 0) {
+    const chars = summaryText.reduce((n, s) => n + s.length, 0)
+    hintBits.push(`${formatCompactionChars(chars)} chars`)
+  }
+  if (hintBits.length > 0) {
+    const hint = document.createElement("span")
+    hint.className = "compaction-chip-hint"
+    hint.textContent = hintBits.join(" · ")
+    chip.appendChild(hint)
+  }
+
+  const body = document.createElement("div")
+  body.className = "compaction-body"
+  const startOpen = openCompactions.has(info.id)
+  body.hidden = !startOpen
+  arrow.textContent = startOpen ? "▾" : "▸"
+
+  if (kvLines.length > 0) {
+    const kv = document.createElement("div")
+    kv.className = "compaction-body-kv"
+    kv.textContent = kvLines.join(" · ")
+    body.appendChild(kv)
+  }
+  if (summaryText.length > 0) {
+    const pre = document.createElement("pre")
+    pre.className = "compaction-body-text"
+    pre.textContent = summaryText.join("\n\n")
+    body.appendChild(pre)
+  }
+
+  const toggle = () => {
+    body.hidden = !body.hidden
+    arrow.textContent = body.hidden ? "▸" : "▾"
+    if (body.hidden) openCompactions.delete(info.id)
+    else openCompactions.add(info.id)
+  }
+  chip.addEventListener("click", toggle)
+  chip.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" || ev.key === " ") {
+      ev.preventDefault()
+      toggle()
+    }
+  })
+
+  wrap.appendChild(chip)
+  wrap.appendChild(body)
+  return wrap
+}
+
+function formatCompactionChars(n: number): string {
+  if (n < 1000) return String(n)
+  if (n < 10000) return `${(n / 1000).toFixed(1)}k`
+  if (n < 1_000_000) return `${Math.round(n / 1000)}k`
+  return `${(n / 1_000_000).toFixed(1)}M`
+}
+
+function renderPart(part: Part, messageID: string): HTMLElement | null {
   if (part.type === "text") {
     const text = (part as { text: string }).text ?? ""
     if (!text) return null
@@ -1053,7 +1248,46 @@ function renderPart(part: Part): HTMLElement | null {
     return div
   }
   if (part.type === "tool") {
-    return renderToolPart(part as ToolPart)
+    // The `question` tool renders as a card, not the generic tool row.
+    // Two paths depending on state.status:
+    //   • running  → interactive card (Plan-B: the pending question lives
+    //     here in the assistant bubble, not as a floating card at the
+    //     bottom of the messages list). Match by tool.callID via
+    //     findPendingQuestionForTool so the same DOM is used whether the
+    //     user has just started answering or is mid-typing after a
+    //     partial-render round trip. Selections survive rerenders via the
+    //     questionDrafts memo inside questions.ts.
+    //   • completed / error → read-only card via renderAnsweredQuestionCard,
+    //     showing what was asked and what the user picked, with disabled
+    //     inputs. Errored calls surface as "Question dismissed".
+    // Anything else falls back to the generic tool row (should not
+    // normally happen for tool="question", but avoids a blank tool part
+    // if the server ever adds a new status).
+    const tp = part as ToolPart
+    if (tp.tool === "question") {
+      const status = tp.state.status
+      if (status === "running") {
+        const req = findPendingQuestionForTool(messageID, tp.callID)
+        if (req) return buildQuestionCard(req)
+        // No matching pending request: SSE ordering hiccup, or the ask
+        // has already been answered on the server but the tool part
+        // hasn't observed the transition yet. Render a tiny placeholder
+        // instead of a stale interactive card that could double-submit.
+        const placeholder = document.createElement("div")
+        placeholder.className = "question-card answered"
+        const header = document.createElement("div")
+        header.className = "question-header"
+        header.textContent = "Question (loading…)"
+        placeholder.appendChild(header)
+        return placeholder
+      }
+      // completed or error → clear any lingering draft (user can't edit
+      // a settled question) and render the read-only card.
+      clearQuestionDraft(tp.callID)
+      const card = renderAnsweredQuestionCard(tp)
+      if (card) return card
+    }
+    return renderToolPart(tp)
   }
   if (part.type === "file") {
     const fp = part as { mime?: string; url?: string; filename?: string }
@@ -1081,15 +1315,162 @@ function renderPart(part: Part): HTMLElement | null {
     return wrap
   }
   if (part.type === "step-start" || part.type === "step-finish") return null
-  if (part.type === "patch") {
-    const div = document.createElement("div")
-    div.className = "tool"
-    const filename =
-      (part as { file?: string; path?: string }).file ?? (part as { path?: string }).path ?? "patch"
-    div.innerHTML = `<div class="tool-header"><span class="tool-icon">✎</span><span class="tool-name">patch</span><span class="tool-target">${escapeHtml(filename)}</span></div>`
-    return div
-  }
+  // `patch` parts are snapshot metadata emitted by the server after every
+  // edit/write/apply_patch (session/processor.ts). They carry a `hash`
+  // (rollback snapshot id) and `files: string[]` (touched paths). We used
+  // to render them as a `✎ patch patch` card, which was pure noise:
+  //   • the edit tool card right above already tells the user which file
+  //     was touched and offers Open / Diff buttons;
+  //   • the snapshot hash is only useful to the server's own rollback
+  //     machinery, not to the user reading the conversation.
+  // Drop the part silently — no visual, no downstream layout impact.
+  if (part.type === "patch") return null
   return null
+}
+
+// Read-only render of a settled (completed / error) `question` tool
+// call. Mirrors the DOM that questions.ts produces for a pending ask
+// (`.question-card` etc.) so past questions look visually identical
+// to live ones, just read-only:
+//   • radios / checkboxes are `disabled` and pre-checked to reflect
+//     what the user actually submitted (state.metadata.answers);
+//   • the custom-answer input is replaced by a disabled text row when
+//     the user typed a free-text answer, otherwise omitted;
+//   • Dismiss / Submit buttons are dropped — nothing to do on a
+//     settled ask;
+//   • header reads "Answered" (or "Dismissed" on error) instead of
+//     the "opencode needs your input" prompt.
+// Interactive rendering for a still-running call is handled by
+// buildQuestionCard in questions.ts. This function returns null on a
+// running part and on parts without a `questions` input; callers fall
+// back to a placeholder or the generic tool card respectively.
+function renderAnsweredQuestionCard(part: ToolPart): HTMLElement | null {
+  const status = part.state.status
+  if (status !== "completed" && status !== "error") return null
+
+  const input = part.state.input as Record<string, unknown>
+  const rawQs = (input as { questions?: unknown }).questions
+  if (!Array.isArray(rawQs) || rawQs.length === 0) return null
+  const questions = rawQs as Array<{
+    question?: string
+    header?: string
+    options?: Array<{ label?: string; description?: string }>
+    multiple?: boolean
+    custom?: boolean
+  }>
+
+  // Answers land on the completed part's metadata (see
+  // packages/opencode/src/tool/question.ts). On error the array is
+  // absent — the card still shows what was asked as a record.
+  const meta = (part.state as { metadata?: unknown }).metadata as
+    | { answers?: unknown }
+    | undefined
+  const answers: string[][] = Array.isArray(meta?.answers)
+    ? (meta!.answers as unknown[]).map((a) => (Array.isArray(a) ? (a as unknown[]).map(String) : []))
+    : []
+
+  const card = document.createElement("div")
+  card.className = "question-card answered"
+  card.dataset.partId = part.id
+
+  const header = document.createElement("div")
+  header.className = "question-header"
+  header.textContent =
+    status === "error"
+      ? "Question dismissed"
+      : questions.length === 1
+        ? "Question · Answered"
+        : `Questions (${questions.length}) · Answered`
+  card.appendChild(header)
+
+  // Reuse a stable per-part id prefix for input `name` attributes so
+  // radios in the same group behave correctly if the browser cares
+  // (they're disabled, but still worth grouping cleanly).
+  const gid = part.id
+
+  questions.forEach((q, qi) => {
+    const block = document.createElement("div")
+    block.className = "question-block"
+
+    if (questions.length > 1) {
+      const label = document.createElement("div")
+      label.className = "question-index"
+      label.textContent = `Q${qi + 1}${q.header ? " · " + q.header : ""}`
+      block.appendChild(label)
+    }
+
+    if (q.question) {
+      const qtext = document.createElement("div")
+      qtext.className = "question-text"
+      qtext.textContent = q.question
+      block.appendChild(qtext)
+    }
+
+    const picked = new Set(answers[qi] ?? [])
+    const optionLabels = new Set(
+      (q.options ?? []).map((o) => (typeof o?.label === "string" ? o.label : "")),
+    )
+    // Anything in the answer array that isn't a known option label came
+    // from the free-text custom input on the ask card.
+    const customs = (answers[qi] ?? []).filter((a) => !optionLabels.has(a))
+
+    if (q.options && q.options.length > 0) {
+      const opts = document.createElement("div")
+      opts.className = "question-options"
+      for (const opt of q.options) {
+        const label = typeof opt?.label === "string" ? opt.label : ""
+        if (!label) continue
+        const row = document.createElement("label")
+        row.className = "question-option"
+        if (picked.has(label)) row.classList.add("picked")
+        const inputEl = document.createElement("input")
+        inputEl.type = q.multiple ? "checkbox" : "radio"
+        inputEl.name = `q_${gid}_${qi}`
+        inputEl.value = label
+        inputEl.disabled = true
+        inputEl.checked = picked.has(label)
+        const text = document.createElement("span")
+        text.className = "question-option-text"
+        const strong = document.createElement("strong")
+        strong.textContent = label
+        text.appendChild(strong)
+        if (opt.description) {
+          const desc = document.createElement("span")
+          desc.className = "question-option-desc"
+          desc.textContent = " — " + opt.description
+          text.appendChild(desc)
+        }
+        row.appendChild(inputEl)
+        row.appendChild(text)
+        opts.appendChild(row)
+      }
+      block.appendChild(opts)
+    }
+
+    // Free-text answers: render each as a disabled text input styled the
+    // same as the ask card's custom field, so the visual language matches.
+    for (const custom of customs) {
+      const customEl = document.createElement("input")
+      customEl.type = "text"
+      customEl.className = "question-custom"
+      customEl.value = custom
+      customEl.disabled = true
+      block.appendChild(customEl)
+    }
+
+    // "(Unanswered)" hint when the tool settled but nothing was picked
+    // and no custom text was entered — usually means the user dismissed.
+    if ((answers[qi] ?? []).length === 0) {
+      const empty = document.createElement("div")
+      empty.className = "question-empty"
+      empty.textContent = "(Unanswered)"
+      block.appendChild(empty)
+    }
+
+    card.appendChild(block)
+  })
+
+  return card
 }
 
 function renderToolPart(part: ToolPart): HTMLElement {

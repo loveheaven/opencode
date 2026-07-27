@@ -1,36 +1,101 @@
 // Inline question cards (opencode `question` tool).
 //
-// The `question` tool pauses the model until the user answers via
-// POST /question/:id/reply. We render pending asks as a card pinned to the
-// bottom of the message list. State is keyed by request id; a single ask
-// may contain multiple sub-questions, each with options + optional custom
-// answer.
+// Plan-B rendering: pending questions live INSIDE the assistant bubble
+// (on the tool part itself), not as a floating card at the bottom of the
+// messages list. That means:
+//   • This module still owns SSE event handling, the pendingQuestions
+//     Map, and the HTTP submit/reject calls.
+//   • `renderQuestions()` no longer appends anything to the DOM — it
+//     just kicks the messages view to rerender any assistant bubble
+//     whose `question` tool part has a matching pending request.
+//   • The actual card DOM is built by `buildQuestionCard(req)` and
+//     called from messages-view.ts when it encounters a running
+//     `question` tool part. Completed / errored calls go through the
+//     read-only `renderAnsweredQuestionCard` in messages-view.ts.
+//
+// In-flight user selections (option picks + custom text) are memoised
+// in `questionDrafts` keyed by callID so that a mid-stream re-render
+// (e.g. more assistant text arriving after the question was posed)
+// doesn't wipe what the user already ticked.
 
 import type { QuestionRequest } from "./sdk"
 import { getClient, refs, setStatus, state } from "./shared"
 
-// messages-view owns the scroll-to-bottom heuristic; we call it after
-// appending a card so the user's eyes land on the fresh prompt.
+// messages-view owns the scroll heuristic and the "rerender assistant
+// bubble N" hook. Both are injected so this module stays free of a
+// direct import cycle with messages-view.
 let scrollToBottom: () => void = () => {}
-export function initQuestions(deps: { scrollToBottom: () => void }) {
+let rerenderMessage: (messageID: string) => void = () => {}
+export function initQuestions(deps: {
+  scrollToBottom: () => void
+  rerenderMessage?: (messageID: string) => void
+}) {
   scrollToBottom = deps.scrollToBottom
+  if (deps.rerenderMessage) rerenderMessage = deps.rerenderMessage
 }
 
+// Draft state for a running question card. Held outside the DOM so a
+// re-render of the assistant bubble (triggered by a later text delta,
+// a later tool part, etc.) can restore what the user has already picked
+// or typed. Keyed by callID because that value is stable across
+// renders for the same tool call.
+type Draft = {
+  selected: Set<string>[]
+  custom: string[]
+}
+const questionDrafts = new Map<string, Draft>()
+
+export function getQuestionDraft(callID: string): Draft | undefined {
+  return questionDrafts.get(callID)
+}
+
+// Called when the tool call transitions away from `running` (completed
+// or errored) so we don't leak drafts across replies.
+export function clearQuestionDraft(callID: string) {
+  questionDrafts.delete(callID)
+}
+
+// Called by events.ts on `question.asked` / `question.replied` /
+// `question.rejected`. Reruns the matching assistant bubble's render
+// so the tool part swaps between "pending interactive" / "answered
+// read-only" / "dismissed read-only" without any special-case DOM
+// splicing.
 export function renderQuestions() {
-  // Wipe any previously-rendered cards and re-render the current pending set.
-  // The list is small (usually 0-1 asks) so full rerender is fine.
-  for (const el of Array.from(refs.messages.querySelectorAll(".question-card"))) el.remove()
+  // Ask messages-view to redraw every assistant message that owns a
+  // pending question. `req.tool` is set by tool/question.ts whenever
+  // the ask comes from a tool call, which is the only case we care
+  // about — direct API askers (rare) have no bubble to update.
+  const affected = new Set<string>()
   for (const req of state.pendingQuestions.values()) {
-    refs.messages.appendChild(renderQuestionCard(req))
+    if (req.tool?.messageID) affected.add(req.tool.messageID)
   }
-  // If a card was just added, scroll it into view — user needs to see it.
+  for (const id of affected) rerenderMessage(id)
   if (state.pendingQuestions.size > 0) scrollToBottom()
+
+  // Legacy cleanup: earlier versions rendered pending cards as direct
+  // children of refs.messages. If any such stragglers survive (e.g. a
+  // reload happened mid-stream) sweep them so we don't show two cards.
+  for (const el of Array.from(refs.messages.querySelectorAll(":scope > .question-card:not(.answered)"))) {
+    el.remove()
+  }
 }
 
-function renderQuestionCard(req: QuestionRequest): HTMLElement {
+// Build the interactive card for a running question. Called from
+// messages-view.ts when it renders a `tool: "question"` part whose
+// state.status is "running" and finds a matching pending request.
+//
+// Returns an element that:
+//   • shows the same question / options / custom input layout as the
+//     old floating card;
+//   • persists partially-filled selections into `questionDrafts` so
+//     an incremental re-render doesn't lose them;
+//   • posts to /question/:id/reply on Submit and to /question/:id/reject
+//     on Dismiss, then clears the draft.
+export function buildQuestionCard(req: QuestionRequest): HTMLElement {
   const card = document.createElement("div")
   card.className = "question-card"
   card.dataset.questionId = req.id
+  if (req.tool?.callID) card.dataset.callId = req.tool.callID
 
   const header = document.createElement("div")
   header.className = "question-header"
@@ -39,20 +104,20 @@ function renderQuestionCard(req: QuestionRequest): HTMLElement {
     : `opencode needs your input (${req.questions.length} questions)`
   card.appendChild(header)
 
-  // Per-question local state: which options are selected + optional custom text.
-  // Held in closures so the submit handler can read them without DOM diving.
-  type QState = { selected: Set<string>; custom: string; multiple: boolean; allowCustom: boolean }
-  const perQuestion: QState[] = []
+  // Restore or initialise the draft for this callID (or by req.id if
+  // no tool binding — the ask API path).
+  const draftKey = req.tool?.callID ?? req.id
+  const existing = questionDrafts.get(draftKey)
+  const draft: Draft = existing ?? {
+    selected: req.questions.map(() => new Set<string>()),
+    custom: req.questions.map(() => ""),
+  }
+  if (!existing) questionDrafts.set(draftKey, draft)
 
   req.questions.forEach((q, qi) => {
-    const qs: QState = {
-      selected: new Set<string>(),
-      custom: "",
-      // Schema default: custom is true unless explicitly disabled.
-      multiple: q.multiple === true,
-      allowCustom: q.custom !== false,
-    }
-    perQuestion.push(qs)
+    const multiple = q.multiple === true
+    // Schema default: custom is true unless explicitly disabled.
+    const allowCustom = q.custom !== false
 
     const block = document.createElement("div")
     block.className = "question-block"
@@ -76,18 +141,17 @@ function renderQuestionCard(req: QuestionRequest): HTMLElement {
         const row = document.createElement("label")
         row.className = "question-option"
         const input = document.createElement("input")
-        // Multi-select uses checkboxes; single-select uses radios grouped
-        // per question so only one option ever stays picked.
-        input.type = qs.multiple ? "checkbox" : "radio"
-        input.name = `q_${req.id}_${qi}`
+        input.type = multiple ? "checkbox" : "radio"
+        input.name = `q_${draftKey}_${qi}`
         input.value = opt.label
+        input.checked = draft.selected[qi].has(opt.label)
         input.addEventListener("change", () => {
-          if (qs.multiple) {
-            if (input.checked) qs.selected.add(opt.label)
-            else qs.selected.delete(opt.label)
+          if (multiple) {
+            if (input.checked) draft.selected[qi].add(opt.label)
+            else draft.selected[qi].delete(opt.label)
           } else {
-            qs.selected.clear()
-            if (input.checked) qs.selected.add(opt.label)
+            draft.selected[qi].clear()
+            if (input.checked) draft.selected[qi].add(opt.label)
           }
         })
         const text = document.createElement("span")
@@ -104,21 +168,25 @@ function renderQuestionCard(req: QuestionRequest): HTMLElement {
         row.appendChild(input)
         row.appendChild(text)
         opts.appendChild(row)
-        // Focus the first radio in the first question for keyboard flow.
-        if (qi === 0 && oi === 0 && !qs.multiple) setTimeout(() => input.focus(), 0)
+        // Focus the first radio in the first question for keyboard flow —
+        // but only on the very first render (i.e. before any draft
+        // exists), otherwise refocusing on every incremental rerender
+        // steals the user's caret from wherever they typed.
+        if (!existing && qi === 0 && oi === 0 && !multiple) setTimeout(() => input.focus(), 0)
       })
       block.appendChild(opts)
     }
 
-    if (qs.allowCustom) {
+    if (allowCustom) {
       const custom = document.createElement("input")
       custom.type = "text"
       custom.className = "question-custom"
       custom.placeholder = q.options.length > 0 ? "Or type your own answer…" : "Type your answer…"
+      custom.value = draft.custom[qi]
       custom.addEventListener("input", () => {
-        qs.custom = custom.value
+        draft.custom[qi] = custom.value
       })
-      // Enter in the last custom field submits.
+      // Enter in the custom field submits.
       custom.addEventListener("keydown", (e) => {
         if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault()
@@ -146,14 +214,10 @@ function renderQuestionCard(req: QuestionRequest): HTMLElement {
   actions.appendChild(submitBtn)
   card.appendChild(actions)
 
-  // Build the answers[] payload the server expects: one string[] per question,
-  // containing every picked label plus (if provided) the custom free-text
-  // answer. Empty string means "no answer" for this question — the tool
-  // reports it as "Unanswered" back to the model, which is fine.
   const buildAnswers = (): string[][] =>
-    perQuestion.map((qs) => {
-      const answers = Array.from(qs.selected)
-      const trimmed = qs.custom.trim()
+    draft.selected.map((sel, i) => {
+      const answers = Array.from(sel)
+      const trimmed = draft.custom[i].trim()
       if (trimmed) answers.push(trimmed)
       return answers
     })
@@ -162,8 +226,6 @@ function renderQuestionCard(req: QuestionRequest): HTMLElement {
     const client = getClient()
     if (!client) return
     const answers = buildAnswers()
-    // Refuse to send a payload that answers nothing — server would accept it
-    // but the model gets zero information, wasting a turn.
     if (answers.every((a) => a.length === 0)) {
       setStatus("Answer at least one question or click Dismiss.")
       return
@@ -172,9 +234,7 @@ function renderQuestionCard(req: QuestionRequest): HTMLElement {
     dismissBtn.disabled = true
     try {
       await client.replyQuestion(req.id, answers)
-      // question.replied SSE clears the card; if it doesn't arrive within a
-      // reasonable window (server bug / network hiccup), the local delete
-      // below keeps the UI honest.
+      questionDrafts.delete(draftKey)
       state.pendingQuestions.delete(req.id)
       renderQuestions()
     } catch (err) {
@@ -191,6 +251,7 @@ function renderQuestionCard(req: QuestionRequest): HTMLElement {
     dismissBtn.disabled = true
     try {
       await client.rejectQuestion(req.id)
+      questionDrafts.delete(draftKey)
       state.pendingQuestions.delete(req.id)
       renderQuestions()
     } catch (err) {
@@ -201,4 +262,16 @@ function renderQuestionCard(req: QuestionRequest): HTMLElement {
   }
 
   return card
+}
+
+// Find the pending request that corresponds to a given tool part on an
+// assistant message. Matching is done via
+// `tool: { messageID, callID }` which the server fills in whenever a
+// question is asked through the `question` tool (see
+// packages/opencode/src/tool/question.ts:27).
+export function findPendingQuestionForTool(messageID: string, callID: string): QuestionRequest | undefined {
+  for (const req of state.pendingQuestions.values()) {
+    if (req.tool?.messageID === messageID && req.tool.callID === callID) return req
+  }
+  return undefined
 }
