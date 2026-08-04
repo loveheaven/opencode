@@ -55,6 +55,7 @@ import {
 } from "./messages-view"
 import { initQuestions, renderQuestions } from "./questions"
 import { initEvents, subscribeEvents } from "./events"
+import { noteObservedUpdated, startSyncPoll, syncNow } from "./sync"
 import { getClient, initSharedRefs, log, refs, setClient, setStatus, state } from "./shared"
 
 // Extension-host bridge (webview → vscode)
@@ -372,6 +373,12 @@ async function bootstrap(msg: {
   // per-session rehydrate above and SSE subscribe where server-side asks
   // could slip through; a second sweep guarantees we don't miss any.
   await rehydratePermissions()
+  // Cross-client sync poll: 3s cadence, reloads the current session's
+  // messages whenever `time.updated` advances. Complements SSE — needed
+  // because messages produced by a different opencode process (e.g. mobile
+  // going through boxclaw) never reach our in-memory event bus even though
+  // they share the same SQLite DB.
+  startSyncPoll()
   setStatus("Ready")
 }
 
@@ -447,6 +454,11 @@ async function selectSession(sessionID: string) {
     const messages = await client.getMessages(sessionID)
     for (const m of messages) recordMessage(m)
     renderAllMessages()
+    // Seed the cross-client sync baseline: our current view is up to the
+    // session's latest `time.updated`, so the poll should only reload after
+    // something changes upstream (e.g. mobile sends a message via boxclaw).
+    const seed = state.sessions.find((s) => s.id === sessionID)?.time?.updated
+    noteObservedUpdated(sessionID, seed)
   } catch (err) {
     setStatus(`Failed to load messages: ${(err as Error).message}`)
   }
@@ -500,6 +512,12 @@ async function sendPrompt() {
   // but block truly empty submits.
   if (!text && attachments.length === 0) return
   if (state.busy) return
+
+  // Catch up on any messages another client (e.g. mobile via boxclaw) wrote
+  // into this session while we were idle. Without this, our first assistant
+  // reply here would appear stacked on top of a stale history and confuse
+  // the model. syncNow() is a no-op when nothing changed.
+  await syncNow()
 
   // Intentionally do NOT pre-generate a messageID here. The opencode server
   // mints message ids that embed a monotonically-increasing hex timestamp
