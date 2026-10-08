@@ -103,6 +103,59 @@ export function flushOrphanParts() {
   }
   orphanParts.length = 0
   orphanParts.push(...remaining)
+  flushOrphanDeltas()
+}
+
+// Buffered `message.part.delta` events whose target part/message wasn't in
+// `state.messages` yet when the delta arrived.
+//
+// Why this is needed: assistant text is streamed almost entirely through
+// `message.part.delta` (one event per token chunk — a short reply produces
+// 30+ of them, see the SSE trace). The delta payload carries only
+// `{ messageID, partID, field, delta }`, NOT the part object, so unlike
+// `message.part.updated` it cannot self-heal by creating the record. The
+// original handler simply `return`ed when the message or part was missing,
+// silently dropping the text forever.
+//
+// That happens whenever delta events out-run their `part.updated`:
+//   • webview subscribes mid-turn (reload window while the model is typing)
+//   • SSE reconnects after a network blip and replays from a later offset
+//   • the `part.updated` for a brand-new part is still queued behind a
+//     `renderIncremental` microtask
+// Symptom: the reply "never arrives" even though the server finished fine
+// and the status line sits at "Ready" — exactly the bug being chased here.
+//
+// Deltas are order-sensitive (they concatenate), so the buffer keeps
+// insertion order and replays in that order once the part materialises.
+const orphanDeltas: { messageID: string; partID: string; field: string; delta: string }[] = []
+
+/** Apply one streaming delta, buffering it when its part isn't known yet. */
+export function applyPartDelta(messageID: string, partID: string, field: string, delta: string) {
+  const entry = state.messages.get(messageID)
+  const part = entry?.parts.get(partID) as Record<string, unknown> | undefined
+  if (!entry || !part) {
+    // Cap the buffer so a genuinely bogus stream can't grow it unbounded.
+    if (orphanDeltas.length < 5000) orphanDeltas.push({ messageID, partID, field, delta })
+    return false
+  }
+  part[field] = ((part[field] as string) ?? "") + delta
+  return true
+}
+
+function flushOrphanDeltas() {
+  if (orphanDeltas.length === 0) return
+  const remaining: typeof orphanDeltas = []
+  for (const d of orphanDeltas) {
+    const entry = state.messages.get(d.messageID)
+    const part = entry?.parts.get(d.partID) as Record<string, unknown> | undefined
+    if (!entry || !part) {
+      remaining.push(d)
+      continue
+    }
+    part[d.field] = ((part[d.field] as string) ?? "") + d.delta
+  }
+  orphanDeltas.length = 0
+  orphanDeltas.push(...remaining)
 }
 
 /** Reset the messages list; used on session switch. */
@@ -110,6 +163,7 @@ export function clearMessagesRender() {
   state.messages.clear()
   state.messageOrder.length = 0
   orphanParts.length = 0
+  orphanDeltas.length = 0
   openCompactions.clear()
   refs.messages.innerHTML = ""
 }
@@ -451,7 +505,7 @@ function renderErrorCard(err: { name?: string; message?: string; data?: unknown 
   header.className = "tool-header error-card-header"
   const icon = document.createElement("span")
   icon.className = "tool-icon"
-  icon.textContent = errorIconGlyph(c.kind)
+  icon.innerHTML = errorIconSvg(c.kind)
   header.appendChild(icon)
   const title = document.createElement("span")
   title.className = "tool-name"
@@ -653,20 +707,20 @@ function pickSessionModel(): { providerID: string; modelID: string } | undefined
   return undefined
 }
 
-function errorIconGlyph(kind: ErrorKind): string {
+function errorIconSvg(kind: ErrorKind): string {
   switch (kind) {
     case "context":
-      return "📏"
+      return svgIcon("ruler")
     case "rate-limit":
-      return "⏱"
+      return svgIcon("timer")
     case "auth":
-      return "🔒"
+      return svgIcon("lock")
     case "upstream":
-      return "☁"
+      return svgIcon("cloud")
     case "network":
-      return "🌐"
+      return svgIcon("wifi-off")
     default:
-      return "⚠"
+      return svgIcon("alert-triangle")
   }
 }
 
@@ -1244,7 +1298,7 @@ function renderPart(part: Part, messageID: string): HTMLElement | null {
     if (!text) return null
     const div = document.createElement("div")
     div.className = "tool"
-    div.innerHTML = `<div class="tool-header"><span class="tool-icon">💭</span><span class="tool-name">reasoning</span></div><div class="tool-body">${escapeHtml(text)}</div>`
+    div.innerHTML = `<div class="tool-header"><span class="tool-icon">${svgIcon("brain")}</span><span class="tool-name">reasoning</span></div><div class="tool-body">${escapeHtml(text)}</div>`
     return div
   }
   if (part.type === "tool") {
@@ -1672,7 +1726,7 @@ function renderToolIconElement(part: ToolPart): HTMLElement {
     }
   }
 
-  span.textContent = toolIconGlyph(part.tool)
+  span.innerHTML = toolIconSvg(part.tool)
   return span
 }
 
@@ -1680,29 +1734,79 @@ function isFileTool(tool: string): boolean {
   return tool === "read" || tool === "write" || tool === "edit" || tool === "apply_patch"
 }
 
-// Fallback emoji glyphs for tools that either aren't file-scoped or have
-// no discoverable file path in their input (rare — usually a bug in the
-// caller). Kept as a lookup so renderToolIconElement can short-circuit
-// back to the old behaviour without a per-tool branch.
-function toolIconGlyph(tool: string): string {
+// Inline Lucide-style SVG icons for tool cards. We switched from emoji
+// (📖 ✎ $ 🔍 …) to inline SVG because emoji render inconsistently across
+// platforms/fonts and don't inherit the theme foreground colour — SVGs
+// with stroke="currentColor" look identical everywhere and pick up the
+// `.tool-icon` colour + opacity. Kept as a lookup so renderToolIconElement
+// can short-circuit here whenever a tool isn't file-scoped (or a file tool
+// has no discoverable path). Icons are 16×16, 1.5px stroke, no fill.
+function toolIconSvg(tool: string): string {
+  return svgIcon(toolIconName(tool))
+}
+
+function toolIconName(tool: string): IconName {
   switch (tool) {
     case "read":
-      return "📖"
+      return "book-open"
     case "write":
+      return "file-plus"
     case "edit":
     case "apply_patch":
-      return "✎"
+      return "pencil"
     case "shell":
     case "bash":
-      return "$"
+      return "terminal"
     case "glob":
+      return "folder-search"
     case "grep":
-      return "🔍"
+      return "search"
+    case "webfetch":
+      return "globe"
     case "task":
-      return "🧵"
+      return "list-todo"
+    case "todowrite":
+    case "todoread":
+      return "list-checks"
+    case "question":
+      return "help-circle"
     default:
-      return "⚙"
+      return "settings"
   }
+}
+
+// Lucide icon path data (https://lucide.dev, ISC). Each entry is the inner
+// markup of a 24×24 0-based viewBox; svgIcon() wraps it with the shared
+// stroke attributes so adding an icon is one line here.
+type IconName =
+  | "book-open" | "file-plus" | "pencil" | "terminal" | "folder-search"
+  | "search" | "globe" | "list-todo" | "list-checks" | "help-circle"
+  | "settings" | "brain" | "ruler" | "timer" | "lock" | "cloud"
+  | "wifi-off" | "alert-triangle"
+
+const ICON_PATHS: Record<IconName, string> = {
+  "book-open": `<path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/>`,
+  "file-plus": `<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M9 15h6"/><path d="M12 18v-6"/>`,
+  pencil: `<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/>`,
+  terminal: `<path d="m4 17 6-6-6-6"/><path d="M12 19h8"/>`,
+  "folder-search": `<path d="M10.7 21H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H20a2 2 0 0 1 2 2v3.5"/><circle cx="17.5" cy="17.5" r="2.5"/><path d="M22 22l-1.5-1.5"/>`,
+  search: `<path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/>`,
+  globe: `<circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/>`,
+  "list-todo": `<rect x="3" y="5" width="6" height="6" rx="1"/><path d="m3 17 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/>`,
+  "list-checks": `<path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/>`,
+  "help-circle": `<circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/>`,
+  settings: `<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>`,
+  brain: `<path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/>`,
+  ruler: `<path d="M21.3 15.3a2.4 2.4 0 0 1 0 3.4l-2.6 2.6a2.4 2.4 0 0 1-3.4 0L2.7 8.7a2.41 2.41 0 0 1 0-3.4l2.6-2.6a2.41 2.41 0 0 1 3.4 0Z"/><path d="m14.5 12.5 2-2"/><path d="m11.5 9.5 2-2"/><path d="m8.5 6.5 2-2"/><path d="m17.5 15.5 2-2"/>`,
+  timer: `<path d="M10 2h4"/><path d="M12 14v-4"/><circle cx="12" cy="14" r="8"/>`,
+  lock: `<rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>`,
+  cloud: `<path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/>`,
+  "wifi-off": `<path d="M12 20h.01"/><path d="M8.5 16.429a5 5 0 0 1 7 0"/><path d="M5 12.859a10 10 0 0 1 5.17-2.69"/><path d="M19 12.859a10 10 0 0 0-2.007-1.523"/><path d="M2 8.82a15 15 0 0 1 4.177-2.643"/><path d="M22 8.82a15 15 0 0 0-11.288-3.764"/><path d="m2 2 20 20"/>`,
+  "alert-triangle": `<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/>`,
+}
+
+function svgIcon(name: IconName): string {
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICON_PATHS[name]}</svg>`
 }
 
 // Map a file path to a compact badge label + accent colour class. The

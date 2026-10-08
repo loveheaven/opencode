@@ -12,8 +12,12 @@
 import type { EventPayload, Message, Part, SessionInfo } from "./sdk"
 import { getClient, setStatus, state } from "./shared"
 import {
+  applyPartDelta,
+  clearMessagesRender,
   flushOrphanParts,
+  recordMessage,
   removeMessageFromDom,
+  renderAllMessages,
   renderIncremental,
   showSessionError,
   upsertMessage,
@@ -55,6 +59,67 @@ export function subscribeEvents() {
 export function unsubscribeEvents() {
   unsubscribe?.()
   unsubscribe = undefined
+}
+
+// Guard so overlapping session.idle events (one per step boundary on a
+// multi-step turn) don't fire several concurrent reloads.
+let reconciling = false
+
+/**
+ * Post-turn consistency check.
+ *
+ * Runs on `session.idle`. If the visible message list is missing the
+ * assistant's reply — i.e. we hold no assistant entry that carries any
+ * renderable content — the SSE stream lost something and the user is left
+ * looking at an idle composer with no answer. Re-fetch the authoritative
+ * list and re-render.
+ *
+ * Deliberately conservative: it only reloads when the list actually looks
+ * broken, so the normal path stays a no-op and never causes flicker.
+ */
+async function reconcileAfterIdle() {
+  if (reconciling) return
+  const client = getClient()
+  const sid = state.sessionID
+  if (!client || !sid) return
+
+  // Does the local state already contain a renderable assistant reply?
+  const hasAssistantContent = state.messageOrder.some((id) => {
+    const entry = state.messages.get(id)
+    if (!entry || entry.info.role !== "assistant") return false
+    return entry.partOrder.some((pid) => {
+      const p = entry.parts.get(pid) as { type?: string; text?: string; synthetic?: boolean } | undefined
+      if (!p) return false
+      if (p.type === "text") return !!p.text && !p.synthetic
+      return p.type === "tool" || p.type === "reasoning"
+    })
+  })
+  // Also treat a message carrying an error as "content" — the error card is
+  // a legitimate result and must not trigger a reload loop.
+  const hasError = state.messageOrder.some(
+    (id) => !!(state.messages.get(id)?.info as { error?: unknown } | undefined)?.error,
+  )
+  if (hasAssistantContent || hasError) return
+
+  reconciling = true
+  try {
+    const messages = await client.getMessages(sid)
+    if (state.sessionID !== sid) return
+    // Only rebuild if the server really does have more than we do —
+    // otherwise an empty session would reload on every idle tick.
+    const serverHasReply = messages.some(
+      (m) => m.info.role === "assistant" && (m.parts ?? []).some((p) => (p as { type?: string }).type === "text"),
+    )
+    if (!serverHasReply) return
+    clearMessagesRender()
+    for (const m of messages) recordMessage(m)
+    renderAllMessages()
+    setStatus("Ready")
+  } catch {
+    // Network hiccup — the 3s sync poll in sync.ts will catch up later.
+  } finally {
+    reconciling = false
+  }
 }
 
 function onServerEvent(evt: EventPayload) {
@@ -119,11 +184,16 @@ function onServerEvent(evt: EventPayload) {
       const partID = evt.properties.partID as string
       const field = evt.properties.field as string
       const delta = evt.properties.delta as string
-      const entry = state.messages.get(messageID)
-      if (!entry) return
-      const part = entry.parts.get(partID) as Record<string, unknown> | undefined
-      if (!part) return
-      part[field] = ((part[field] as string) ?? "") + delta
+      // Assistant text streams almost entirely through this event (one per
+      // token chunk). The payload has no part object, so we can't create
+      // the record here the way `message.part.updated` does — if the part
+      // isn't known yet, applyPartDelta buffers the chunk and replays it
+      // in order once `part.updated` lands. The old code just returned,
+      // which silently threw away the whole reply whenever deltas out-ran
+      // their part (webview reload mid-turn, SSE reconnect, microtask
+      // ordering) — the "sent a message, got nothing, status says Ready"
+      // failure mode.
+      applyPartDelta(messageID, partID, field, delta)
       renderIncremental(messageID)
       return
     }
@@ -136,6 +206,15 @@ function onServerEvent(evt: EventPayload) {
     case "session.idle": {
       state.busy = false
       deps?.setBusy(false)
+      // Self-heal safety net. The turn is over as far as the server is
+      // concerned, so whatever we have in `state.messages` should already
+      // match the server. If the DOM is still empty (or holds nothing but
+      // the user's own bubble), some events went missing on the way here
+      // and the user is staring at "Ready" with no answer — the exact
+      // symptom this net exists to kill. Re-pull the whole message list
+      // once; it's a single cheap GET and only fires in the broken case.
+      const sessionID = evt.properties.sessionID as string | undefined
+      if (!sessionID || sessionID === state.sessionID) void reconcileAfterIdle()
       return
     }
     case "session.error": {
