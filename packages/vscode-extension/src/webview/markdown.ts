@@ -7,9 +7,9 @@
 //
 // Security posture: markdown-it is configured with `html: false`, so any
 // raw HTML in the input renders as text — no XSS surface even without an
-// extra sanitizer. Autolinks (`linkify`) are also off; LLMs already emit
-// proper `[text](url)` markdown and we want plain `example.com` in prose
-// to stay text.
+// extra sanitizer. Autolinks (`linkify`) are enabled but restricted to
+// http(s) URLs via `validateLink`, so bare `https://…` in prose becomes
+// clickable while plain `example.com` and emails stay text.
 //
 // Styling note: markdown-it emits stock tag names (`<table>`, `<del>`, etc.).
 // We add a `.md-table` class on tables via a renderer override so the CSS
@@ -52,7 +52,7 @@ const md = new MarkdownIt({
   // (line-broken poetry, aligned commands, etc.); default CommonMark would
   // merge them into a single paragraph.
   breaks: true,
-  linkify: false,
+  linkify: true,
   typographer: false,
   // Wrap highlighted HTML in <pre><code class="hljs language-…"> so the
   // github/github-dark stylesheets we ship apply. Returning full markup
@@ -62,6 +62,10 @@ const md = new MarkdownIt({
     return `<pre><code class="${cls}">${highlight(code, lang)}</code></pre>`
   },
 })
+
+// Only auto-link http(s) URLs. linkify-it would otherwise also link bare
+// domains (`example.com`) and emails; we keep those as plain text.
+md.validateLink = (url) => /^https?:\/\//i.test(url)
 
 // Add a class to tables so styles.css `.md-table` selectors keep applying.
 // markdown-it's default is `<table>` with no class — one line override.

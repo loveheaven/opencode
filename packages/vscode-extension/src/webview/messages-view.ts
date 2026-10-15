@@ -848,11 +848,15 @@ function renderMessage(entry: MessageEntry): HTMLElement | null {
     if (textChunks.length === 0 && fileCount === 0) return null
     copyText = textChunks.join("\n")
   } else {
+    // While the assistant turn is still streaming (`finish` unset), keep the
+    // reasoning block expanded so the model's thinking is visible in flight;
+    // once the turn finishes, collapse it behind the header (like tool bodies).
+    const streaming = !(entry.info as { finish?: string }).finish
     const textChunks: string[] = []
     for (const pid of entry.partOrder) {
       const part = entry.parts.get(pid)
       if (!part) continue
-      const el = renderPart(part, entry.info.id)
+      const el = renderPart(part, entry.info.id, streaming)
       if (el) bubble.appendChild(el)
       if (part.type === "text") {
         const tp = part as { text?: string; synthetic?: boolean }
@@ -899,6 +903,14 @@ function renderMessage(entry: MessageEntry): HTMLElement | null {
   const label = document.createElement("span")
   label.textContent = entry.info.role === "user" ? "You" : agentLabel(entry.info)
   meta.appendChild(label)
+  const created = (entry.info as { time?: { created?: number } }).time?.created
+  if (created) {
+    const time = document.createElement("span")
+    time.className = "msg-time"
+    time.textContent = formatMessageTime(created)
+    time.title = new Date(created).toLocaleString()
+    meta.appendChild(time)
+  }
   // Token/cost badge on assistant messages: opencode reports usage per turn on
   // the assistant message metadata. Only render when the server actually filled
   // it in (finished turns) so partial in-flight streams stay quiet.
@@ -971,6 +983,13 @@ function formatCost(usd: number): string {
   if (usd < 0.01) return `$${usd.toFixed(4)}`
   if (usd < 1) return `$${usd.toFixed(3)}`
   return `$${usd.toFixed(2)}`
+}
+
+// Local-time HH:MM for the per-message meta row; the full timestamp goes in
+// the element's title attribute (see renderMessage).
+function formatMessageTime(ms: number): string {
+  const d = new Date(ms)
+  return `${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`
 }
 
 // Small pill next to the agent label showing per-turn token usage. Returns
@@ -1283,7 +1302,7 @@ function formatCompactionChars(n: number): string {
   return `${(n / 1_000_000).toFixed(1)}M`
 }
 
-function renderPart(part: Part, messageID: string): HTMLElement | null {
+function renderPart(part: Part, messageID: string, streaming = false): HTMLElement | null {
   if (part.type === "text") {
     const text = (part as { text: string }).text ?? ""
     if (!text) return null
@@ -1298,7 +1317,15 @@ function renderPart(part: Part, messageID: string): HTMLElement | null {
     if (!text) return null
     const div = document.createElement("div")
     div.className = "tool"
-    div.innerHTML = `<div class="tool-header"><span class="tool-icon">${svgIcon("brain")}</span><span class="tool-name">reasoning</span></div><div class="tool-body">${escapeHtml(text)}</div>`
+    const header = document.createElement("div")
+    header.className = "tool-header"
+    header.innerHTML = `<span class="tool-icon">${svgIcon("brain")}</span><span class="tool-name">reasoning</span>`
+    const body = document.createElement("div")
+    body.className = streaming ? "tool-body" : "tool-body collapsed"
+    body.innerHTML = escapeHtml(text)
+    header.addEventListener("click", () => body.classList.toggle("collapsed"))
+    div.appendChild(header)
+    div.appendChild(body)
     return div
   }
   if (part.type === "tool") {

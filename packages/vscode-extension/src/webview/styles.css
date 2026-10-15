@@ -96,6 +96,10 @@ html, body, #app {
 }
 .msg.assistant .meta { align-self: flex-start; }
 .msg.user .meta { align-self: flex-end; }
+.msg .msg-time {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 
 /*
  * Copy button on each message's meta row. Kept tiny and low-key so it
