@@ -10,7 +10,7 @@
 // helper); we call back into it through injected setters so this module
 // doesn't need to know about VSCode webview state APIs.
 
-import type { AgentInfo, ProviderInfo } from "./sdk"
+import type { AgentInfo, ProviderInfo } from "../types"
 import { openSettings } from "./settings"
 import { refs, state } from "./shared"
 

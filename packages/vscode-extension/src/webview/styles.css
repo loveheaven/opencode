@@ -1313,6 +1313,7 @@ button.ghost:hover { background: var(--vscode-toolbar-hoverBackground); }
 }
 .mcp-card.mcp-connected { border-left-color: var(--vscode-testing-iconPassed, #23d18b); }
 .mcp-card.mcp-disabled { border-left-color: var(--vscode-descriptionForeground, #888); }
+.mcp-card.mcp-configured { border-left-color: var(--vscode-charts-blue, #3794ff); }
 .mcp-card.mcp-failed { border-left-color: var(--vscode-errorForeground, #f14c4c); }
 .mcp-card.mcp-needs_auth,
 .mcp-card.mcp-needs_client_registration { border-left-color: var(--vscode-notificationsWarningIcon-foreground, #cca700); }
@@ -1323,6 +1324,7 @@ button.ghost:hover { background: var(--vscode-toolbar-hoverBackground); }
 }
 .mcp-dot.mcp-connected { background: var(--vscode-testing-iconPassed, #23d18b); }
 .mcp-dot.mcp-disabled { background: var(--vscode-descriptionForeground, #888); }
+.mcp-dot.mcp-configured { background: var(--vscode-charts-blue, #3794ff); }
 .mcp-dot.mcp-failed { background: var(--vscode-errorForeground, #f14c4c); }
 .mcp-dot.mcp-needs_auth,
 .mcp-dot.mcp-needs_client_registration { background: var(--vscode-notificationsWarningIcon-foreground, #cca700); }
@@ -1333,6 +1335,7 @@ button.ghost:hover { background: var(--vscode-toolbar-hoverBackground); }
   color: var(--vscode-badge-foreground, inherit);
 }
 .mcp-badge.mcp-connected { background: color-mix(in srgb, var(--vscode-testing-iconPassed, #23d18b) 20%, transparent); color: var(--vscode-testing-iconPassed, #23d18b); }
+.mcp-badge.mcp-configured { background: color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 20%, transparent); color: var(--vscode-charts-blue, #3794ff); }
 .mcp-badge.mcp-failed { background: color-mix(in srgb, var(--vscode-errorForeground, #f14c4c) 20%, transparent); color: var(--vscode-errorForeground, #f14c4c); }
 .mcp-badge.mcp-needs_auth,
 .mcp-badge.mcp-needs_client_registration { background: color-mix(in srgb, var(--vscode-notificationsWarningIcon-foreground, #cca700) 20%, transparent); color: var(--vscode-notificationsWarningIcon-foreground, #cca700); }

@@ -18,8 +18,8 @@
 // (e.g. more assistant text arriving after the question was posed)
 // doesn't wipe what the user already ticked.
 
-import type { QuestionRequest } from "./sdk"
-import { getClient, refs, setStatus, state } from "./shared"
+import type { QuestionRequest } from "../model"
+import { backendLabel, getClient, refs, setStatus, state } from "./shared"
 
 // messages-view owns the scroll heuristic and the "rerender assistant
 // bubble N" hook. Both are injected so this module stays free of a
@@ -100,8 +100,8 @@ export function buildQuestionCard(req: QuestionRequest): HTMLElement {
   const header = document.createElement("div")
   header.className = "question-header"
   header.textContent = req.questions.length === 1
-    ? "opencode needs your input"
-    : `opencode needs your input (${req.questions.length} questions)`
+    ? `${backendLabel()} needs your input`
+    : `${backendLabel()} needs your input (${req.questions.length} questions)`
   card.appendChild(header)
 
   // Restore or initialise the draft for this callID (or by req.id if

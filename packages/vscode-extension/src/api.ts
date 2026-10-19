@@ -1,8 +1,13 @@
 // Shared types used by both extension host and webview bundle. Keep this
 // file free of vscode imports so the webview bundler can consume it too.
 
+import type { NeutralUpdate } from "./model"
+import type { BackendCapabilities, BackendKind, BackendStatus } from "./backend"
+
 export type BootstrapMessage = {
   type: "bootstrap"
+  backendKind: BackendKind
+  capabilities: BackendCapabilities
   serverUrl: string
   directory: string
   defaultAgent: string
@@ -123,8 +128,10 @@ export type WebviewRequest =
   | GetDebugRequest
   | SetDebugRequest
   | OpenDebugLogRequest
-  | GetServerConfigRequest
   | AttachToServerRequest
+  | BackendRpcRequest
+  | GetBackendsRequest
+  | SwitchBackendRequest
 
 export type ConfirmResponse = { type: "confirmResponse"; id: string; result: boolean }
 export type InputResponse = { type: "inputResponse"; id: string; value: string | undefined }
@@ -194,23 +201,11 @@ export type DebugStateMessage = { type: "debugState"; enabled: boolean }
 // that URL, verifies it's opencode (identifyOpencode), and either
 // reattaches or spawns a fresh local server as a fallback.
 //
-// Two messages: `getServerConfig` fetches the currently-live URL so the
-// form can preload it; `attachToServer` commits a new preferred URL.
-
-/** Webview asks host for the currently-connected URL so the form and the
- *  live-connection banner can preload correctly. Host replies with
- *  `serverConfig`. */
-export type GetServerConfigRequest = { type: "getServerConfig" }
-export type ServerConfigMessage = {
-  type: "serverConfig"
-  /** The URL the webview is *actually* connected to right now (spawned,
-   *  reattached, or user-attached). Undefined only during early bootstrap
-   *  before the first successful connection. */
-  activeUrl?: string
-  /** How we ended up on `activeUrl` this session. Drives the small
-   *  parenthetical badge next to the URL in Settings. */
-  activeSource?: "spawned" | "reattached" | "external"
-}
+// `attachToServer` pins the URL the extension prefers to talk to. On Attach
+// the host probes that URL, verifies it's opencode (identifyOpencode), and
+// either reattaches or spawns a fresh local server as a fallback. The live
+// URL and its source are reported through `backendsSnapshot` now, since the
+// Attach form lives inside the Backend section.
 
 /** User wants the extension to prefer this URL from now on. Host verifies
  *  it's an opencode server (identifyOpencode) and records it as the
@@ -238,4 +233,72 @@ export type ExtensionMessage =
   | ConfirmResponse
   | InputResponse
   | DebugStateMessage
-  | ServerConfigMessage
+  | BackendRpcResult
+  | BackendUpdateMessage
+  | BackendStatusMessage
+  | BackendsSnapshotMessage
+
+// -----------------------------------------------------------------------
+// Backend RPC — the webview no longer reaches the opencode HTTP API
+// directly. It issues `backend.rpc` calls (dispatched by the host against
+// the selected Backend) and receives NeutralUpdate pushes plus responses.
+// -----------------------------------------------------------------------
+
+/** Webview asks the host to run a method on the active backend. */
+export type BackendRpcRequest = {
+  type: "backend.rpc"
+  id: string
+  method: string
+  args: unknown[]
+}
+
+export type BackendRpcResult = {
+  type: "backend.result"
+  id: string
+  ok: boolean
+  data?: unknown
+  error?: string
+}
+
+export type BackendUpdateMessage = { type: "backend.update"; update: NeutralUpdate }
+export type BackendStatusMessage = { type: "backend.status"; status: BackendStatus }
+
+// -----------------------------------------------------------------------
+// Backend discovery & switching
+// -----------------------------------------------------------------------
+// The Settings tab lists already-running opencode/dsh/pi processes on this
+// machine so the user can see what a switch would attach to, and offers a
+// one-click switch between the three backends.
+
+/** A running agent process found on this machine. */
+export type BackendProcessInfo = {
+  kind: BackendKind
+  pid: number
+  label: string
+  /** Port parsed from the process command line (`serve --port N`). */
+  port?: number
+  /** Hostname parsed from the process command line; undefined means localhost. */
+  hostname?: string
+}
+
+/** Webview asks the host to scan for running backends. Host replies with
+ *  `backendsSnapshot`. */
+export type GetBackendsRequest = { type: "getBackends" }
+export type BackendsSnapshotMessage = {
+  type: "backendsSnapshot"
+  /** The backend the extension is currently driving. */
+  current: BackendKind
+  /** Running processes the host found, grouped only by scanning order. */
+  processes: BackendProcessInfo[]
+  /** The URL the extension is currently driving, used to mark which process
+   *  row is the active one (e.g. `http://127.0.0.1:44850`). */
+  activeUrl?: string
+  /** How we ended up on `activeUrl` this session (spawned / reattached /
+   *  external attach). Drives the badge next to the URL in Settings. */
+  activeSource?: "spawned" | "reattached" | "external"
+}
+
+/** User picked a different backend, or a specific running process of the same
+ *  backend. Host writes `opencode.backend` config (and attaches to `pid` when
+ *  given) then reloads the webview so the new target takes over. */
+export type SwitchBackendRequest = { type: "switchBackend"; kind: BackendKind; pid?: number }

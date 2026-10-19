@@ -17,21 +17,14 @@
 // is a card pinned above the composer, ordered by arrival — the user can
 // scan them, approve/deny in whatever order they like, and keep typing.
 
-import type { OpencodeClient } from "./sdk"
+import type { PermissionRequest } from "../model"
+import type { BackendClient } from "./client"
 import { refs } from "./shared"
 
-export type PermissionAsk = {
-  id: string
-  sessionID: string
-  permission: string
-  patterns?: string[]
-  metadata?: Record<string, unknown>
-  // Server sends `tool: { messageID, callID }` (see schema/src/v1/permission.ts).
-  tool?: { messageID: string; callID: string }
-}
+type PermissionAsk = PermissionRequest
 
 type Deps = {
-  getClient: () => OpencodeClient | undefined
+  getClient: () => BackendClient | undefined
   getCurrentSessionID: () => string | undefined
   setStatus: (text: string) => void
   log: (...args: unknown[]) => void
@@ -99,16 +92,7 @@ export async function rehydratePermissions() {
   if (!client) return
   try {
     const list = await client.listPermissions()
-    for (const p of list) {
-      handlePermissionAsk({
-        id: p.id,
-        sessionID: p.sessionID,
-        permission: p.permission,
-        patterns: p.patterns as string[] | undefined,
-        metadata: p.metadata,
-        tool: p.tool as { messageID: string; callID: string } | undefined,
-      })
-    }
+    for (const p of list) handlePermissionAsk(p)
   } catch (err) {
     deps.log("listPermissions failed", err)
   }
@@ -304,7 +288,7 @@ async function autoApprove(sessionID: string, permissionID: string) {
 // Fire the /permissions/{id} POST. If the client isn't ready yet or the call
 // fails, retry a few times with backoff so the server never gets stuck on an
 // unanswered ask — that would loop back into another permission.asked event.
-async function sendPermissionResponse(sessionID: string, permissionID: string, response: "once" | "always" | "reject") {
+async function sendPermissionResponse(_sessionID: string, permissionID: string, response: "once" | "always" | "reject") {
   if (!deps) return
   if (respondedPermissions.has(permissionID)) {
     deps.log("permission already responded, skip", permissionID)
@@ -317,7 +301,7 @@ async function sendPermissionResponse(sessionID: string, permissionID: string, r
     const client = deps.getClient()
     if (!client) continue
     try {
-      await client.respondPermission(sessionID, permissionID, response)
+      await client.respondPermission(permissionID, response)
       return
     } catch (err) {
       deps.log("respondPermission attempt failed", { permissionID, err })

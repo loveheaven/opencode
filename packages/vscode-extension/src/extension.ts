@@ -6,6 +6,11 @@ import { URL } from "node:url"
 import { ServerManager, identifyOpencode, probeOnce, type ServerStatus } from "./server-manager"
 import type { AttachmentPayload, BootstrapMessage, ExtensionMessage, WebviewRequest } from "./api"
 import { pathToFileURL } from "node:url"
+import type { Backend } from "./backend"
+import { OpencodeBackend } from "./backend/opencode"
+import { DshBackend } from "./backend/dsh"
+import { PiBackend } from "./backend/pi"
+import { scanRunningBackends } from "./backend/process-scan"
 
 const VIEW_ID = "opencode.chat"
 // Key used to persist the debug logging flag across sessions via
@@ -128,6 +133,11 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
   // updated by resolveServerUrlWithFallback and onServerStatus. Settings
   // uses it to label the "Currently talking to …" badge honestly.
   private activeSource: ActiveSource | undefined
+  private backend: Backend | undefined
+  // Serializes initBackend so concurrent reload() calls (config change +
+  // explicit reload, or workspace-folder + config events) can't race and
+  // spawn orphaned backend processes.
+  private backendInitChain: Promise<void> = Promise.resolve()
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -193,20 +203,61 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
     webviewView.webview.onDidReceiveMessage((raw: unknown) => this.onWebviewMessage(raw))
     webviewView.onDidDispose(() => {
       for (const [id] of this.sseStreams) this.proxySseClose(id)
+      void this.backend?.stop()
+      this.backend = undefined
       if (this.view === webviewView) this.view = undefined
     })
 
-    // Resolve server URL BEFORE building HTML so CSP connect-src includes the loopback origin.
-    // Without this, the meta CSP tag is baked with empty connect-src and every fetch/SSE is blocked.
-    this.lastServerUrl = await this.resolveServerUrlWithFallback()
+    // Select and start the backend BEFORE building HTML so the opencode CSP
+    // connect-src still includes the loopback origin when the backend is
+    // opencode-over-HTTP. dsh-over-ACP needs no connect-src (no direct fetch).
+    await this.initBackend()
 
     webviewView.webview.html = await this.buildHtml(webviewView.webview)
     void this.sendBootstrap()
   }
 
+  // Create (or recreate) the backend for the currently configured kind and
+  // wire its neutral stream into the webview. Serialized through
+  // backendInitChain so overlapping reloads run one after another.
+  private initBackend(): Promise<void> {
+    this.backendInitChain = this.backendInitChain.then(() => this.doInitBackend())
+    return this.backendInitChain
+  }
+
+  private async doInitBackend(): Promise<void> {
+    await this.backend?.stop()
+    this.backend = undefined
+    const kind = getConfig().get<string>("backend", "opencode")
+    const directory = getWorkspaceDirectory() ?? ""
+    if (kind === "dsh") {
+      const args = getConfig().get<string[]>("dsh.args", ["--profile", "acp"])
+      this.backend = new DshBackend({
+        command: getConfig().get<string>("dsh.command", "dsh"),
+        args,
+        cwd: getConfig().get<string>("dsh.cwd", "") || directory || process.cwd(),
+      })
+    } else if (kind === "pi") {
+      const args = getConfig().get<string[]>("pi.args", ["--mode", "rpc", "--continue"])
+      this.backend = new PiBackend({
+        command: getConfig().get<string>("pi.command", "pi"),
+        args,
+        cwd: getConfig().get<string>("pi.cwd", "") || directory || process.cwd(),
+      })
+    } else {
+      this.lastServerUrl = await this.resolveServerUrlWithFallback()
+      this.backend = new OpencodeBackend({ baseUrl: this.lastServerUrl ?? "", directory })
+    }
+    this.backend.subscribe({
+      onUpdate: (u) => this.view?.webview.postMessage({ type: "backend.update", update: u }),
+      onStatus: (s) => this.view?.webview.postMessage({ type: "backend.status", status: s }),
+    })
+    await this.backend.start()
+  }
+
   async reload(): Promise<void> {
     if (!this.view) return
-    this.lastServerUrl = await this.resolveServerUrlWithFallback({ preferCachedSpawn: true })
+    await this.initBackend()
     this.view.webview.html = await this.buildHtml(this.view.webview)
     void this.sendBootstrap()
   }
@@ -356,7 +407,18 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
   // external one we have no handle on the process and cannot kill it — but
   // starting our own gives the user a working panel immediately. The newly
   // spawned URL then becomes the remembered "last URL".
+  //
+  // For the subprocess backends (dsh / pi) there is no HTTP server to
+  // restart — "restart" means stop the current child and spawn a fresh one,
+  // which is exactly what reload() → initBackend() does. Skip the opencode
+  // ServerManager entirely so we don't spawn a stray `opencode serve` that
+  // the selected backend would never talk to.
   async restartServer(): Promise<void> {
+    const kind = getConfig().get<string>("backend", "opencode")
+    if (kind === "dsh" || kind === "pi") {
+      await this.reload()
+      return
+    }
     const status = await this.server.start()
     if (status.state === "ready") {
       this.lastServerUrl = status.url
@@ -369,11 +431,13 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async sendBootstrap() {
-    if (!this.view || !this.lastServerUrl) return
+    if (!this.view || !this.backend) return
     const directory = getWorkspaceDirectory() ?? ""
     const msg: BootstrapMessage = {
       type: "bootstrap",
-      serverUrl: this.lastServerUrl,
+      backendKind: this.backend.kind,
+      capabilities: this.backend.capabilities,
+      serverUrl: this.lastServerUrl ?? "",
       directory,
       defaultAgent: getConfig().get<string>("defaultAgent", "").trim(),
       defaultModel: getConfig().get<string>("defaultModel", "").trim(),
@@ -445,10 +509,26 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
         await this.handleInput(msg as Extract<WebviewRequest, { type: "input" }>)
         return
       case "openProviderConfig":
+        if (this.backend?.kind === "pi") {
+          await this.openPiConfig("models.json", "providers", "providers", piModelsScaffold)
+          return
+        }
+        if (this.backend?.kind === "dsh") {
+          await this.openDshConfig()
+          return
+        }
         await this.openOpencodeConfig("provider")
         return
       case "openMcpConfig": {
         const req = msg as Extract<WebviewRequest, { type: "openMcpConfig" }>
+        if (this.backend?.kind === "pi") {
+          await this.openPiConfig("mcp.json", "mcpServers", "mcpServers", piMcpScaffold)
+          return
+        }
+        if (this.backend?.kind === "dsh") {
+          await this.openDshConfig()
+          return
+        }
         await this.openOpencodeConfig("mcp")
         // Optional server name: jump the cursor onto that entry after the
         // section anchor lands. Falls back to the mcp anchor if not found.
@@ -473,6 +553,14 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
         await this.openOpencodeConfig("plugin")
         return
       case "openSkillsConfig":
+        if (this.backend?.kind === "pi") {
+          await this.openPiConfig("settings.json", "skills", "skills", piSettingsScaffold)
+          return
+        }
+        if (this.backend?.kind === "dsh") {
+          await this.openDshConfig()
+          return
+        }
         await this.openOpencodeConfig("skills")
         return
       case "insertProviderConfig": {
@@ -521,20 +609,150 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
       case "openDebugLog":
         this.output.show(true)
         return
-      case "getServerConfig": {
-        this.postServerConfig()
-        return
-      }
       case "attachToServer": {
         const req = msg as Extract<WebviewRequest, { type: "attachToServer" }>
         void this.handleAttachToServer(req.url)
         return
       }
+      case "backend.rpc": {
+        const req = msg as Extract<WebviewRequest, { type: "backend.rpc" }>
+        void this.handleBackendRpc(req)
+        return
+      }
+      case "getBackends": {
+        const current = this.backend?.kind ?? (getConfig().get<string>("backend", "opencode") as Backend["kind"])
+        const ownPid = this.backend?.pid
+        // opencode 可 attach 到任意 serve，全列；pi/dsh 是 stdio 子进程、无法
+        // 跨进程 attach，只列当前窗口自己 spawn 的那个进程。
+        const processes = scanRunningBackends().filter(
+          (p) => p.kind === "opencode" || (ownPid !== undefined && p.pid === ownPid),
+        )
+        this.view?.webview.postMessage({
+          type: "backendsSnapshot",
+          current,
+          processes,
+          activeUrl: this.lastServerUrl,
+          activeSource: this.activeSource,
+        } satisfies ExtensionMessage)
+        return
+      }
+      case "switchBackend": {
+        const req = msg as Extract<WebviewRequest, { type: "switchBackend" }>
+        void this.switchBackend(req.kind, req.pid)
+        return
+      }
+    }
+  }
+
+  // Scan the machine for running opencode/dsh/pi processes and switch the
+  // active backend. Switching writes the `opencode.backend` config and reloads
+  // the webview so initBackend() picks up the new kind.
+  //
+  // When `pid` is given (a specific opencode process row in the Settings tab),
+  // attach to that process's serve instead of a bare backend switch. This is
+  // what distinguishes two opencode windows on one machine — each owns its own
+  // port.
+  private async switchBackend(kind: Backend["kind"], pid?: number): Promise<void> {
+    if (pid !== undefined && kind === "opencode") {
+      const proc = scanRunningBackends().find((p) => p.kind === "opencode" && p.pid === pid)
+      if (proc?.port !== undefined) {
+        const url = `http://${proc.hostname ?? "127.0.0.1"}:${proc.port}`
+        this.output.appendLine(`[opencode-ext] switching opencode to pid=${pid} at ${url}`)
+        // Persist the backend kind BEFORE attaching. handleAttachToServer()
+        // ends in reload() → initBackend(), which re-reads `opencode.backend`
+        // from config to decide which adapter to build. Without this write,
+        // attaching to an opencode process while the active backend is pi/dsh
+        // would reload straight back into the old adapter: the user gets an
+        // "attached to http://…" toast (we really did verify + remember the
+        // URL) but every RPC still goes to pi, so the session drawer comes up
+        // empty because pi's RPC has no session/list. Writing the config here
+        // makes the attach actually take effect.
+        await getConfig().update("backend", kind, vscode.ConfigurationTarget.Global)
+        await this.handleAttachToServer(url)
+        return
+      }
+      this.output.appendLine(`[opencode-ext] pid=${pid} no longer running; falling back to backend switch`)
+    }
+    this.output.appendLine(`[opencode-ext] switching backend to ${kind}`)
+    // Writing `opencode.backend` fires onDidChangeConfiguration, which reloads
+    // the panel. Don't reload again here — a second reload would race the
+    // first and could spawn a second backend process.
+    await getConfig().update("backend", kind, vscode.ConfigurationTarget.Global)
+  }
+
+  // -------------------------------------------------------------------
+  // Backend RPC — routes webview calls against the active backend.
+  // -------------------------------------------------------------------
+
+  private async handleBackendRpc(req: Extract<WebviewRequest, { type: "backend.rpc" }>): Promise<void> {
+    try {
+      const data = await this.dispatchRpc(req.method, req.args)
+      this.view?.webview.postMessage({ type: "backend.result", id: req.id, ok: true, data })
+    } catch (err) {
+      this.view?.webview.postMessage({
+        type: "backend.result",
+        id: req.id,
+        ok: false,
+        error: (err as Error).message ?? String(err),
+      })
+    }
+  }
+
+  private async dispatchRpc(method: string, args: unknown[]): Promise<unknown> {
+    const b = this.backend
+    if (!b) throw new Error("backend not ready")
+    switch (method) {
+      case "listSessions":
+        return b.listSessions()
+      case "createSession":
+        return b.createSession(args[0] as { title?: string } | undefined)
+      case "getMessages":
+        return b.getMessages(args[0] as string)
+      case "prompt":
+        return b.prompt(args[0] as never)
+      case "abort":
+        return b.abort(args[0] as string)
+      case "deleteSession":
+        return b.deleteSession?.(args[0] as string)
+      case "updateSession":
+        return b.updateSession?.(args[0] as string, args[1] as { title?: string })
+      case "compactSession":
+        return b.compactSession?.(args[0] as string, args[1] as string, args[2] as string)
+      case "respondPermission":
+        return b.respondPermission?.(args[0] as string, args[1] as "once" | "always" | "reject")
+      case "listPermissions":
+        return b.listPermissions?.() ?? []
+      case "listQuestions":
+        return b.listQuestions?.() ?? []
+      case "replyQuestion":
+        return b.replyQuestion?.(args[0] as string, args[1] as string[][])
+      case "rejectQuestion":
+        return b.rejectQuestion?.(args[0] as string)
+      case "listAgents":
+        return b.listAgents?.() ?? []
+      case "listCommands":
+        return b.listCommands?.() ?? []
+      case "listSkills":
+        return b.listSkills?.() ?? []
+      case "getMcpStatus":
+        return b.getMcpStatus?.() ?? {}
+      case "mcpConnect":
+        return b.mcpConnect?.(args[0] as string)
+      case "mcpDisconnect":
+        return b.mcpDisconnect?.(args[0] as string)
+      case "listProviders":
+        return b.listProviders?.() ?? []
+      case "getProviderList":
+        return b.getProviderList?.() ?? { all: [], connected: [], default: {} }
+      case "runCommand":
+        return b.runCommand?.(args[0] as never)
+      default:
+        throw new Error(`unknown backend method: ${method}`)
     }
   }
 
   // -------------------------------------------------------------------
-  // Server connection settings ("Settings → Server connection")
+  // Server connection settings ("Settings → Backend → Attach to server")
   // -------------------------------------------------------------------
   //
   // On startup and on user "Attach", the extension prefers a specific URL
@@ -543,14 +761,6 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
   // we spawn a fresh local server and record that URL instead. This UI
   // just lets the user pin a preferred URL — there is no spawn/external
   // mode switch.
-
-  private postServerConfig() {
-    this.view?.webview.postMessage({
-      type: "serverConfig",
-      activeUrl: this.lastServerUrl,
-      activeSource: this.activeSource,
-    } satisfies ExtensionMessage)
-  }
 
   private async handleAttachToServer(url: string | undefined) {
     const clean = (url ?? "").trim().replace(/\/+$/, "")
@@ -836,7 +1046,7 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
 
     if (created) {
       vscode.window.showInformationMessage(
-        `Created opencode.jsonc with scaffold for provider / mcp / plugin / skills. Edit the ${section} section, save, then run "OpenCode: Restart Server" to apply.`,
+        `Created opencode.jsonc with scaffold for provider / mcp / plugin / skills. Edit the ${section} section, save, then run "Restart Server" to apply.`,
       )
     } else if (!doc.getText().includes(anchor)) {
       vscode.window.showInformationMessage(
@@ -914,7 +1124,7 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
     }
 
     vscode.window.showInformationMessage(
-      `Provider "${id}" added${created ? " (config file was created)" : ""}. Review the entry, save, then run "OpenCode: Restart Server" to activate.`,
+      `Provider "${id}" added${created ? " (config file was created)" : ""}. Review the entry, save, then run "Restart Server" to activate.`,
     )
   }
 
@@ -931,11 +1141,6 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
   // behaviour rather than shelling out to `opencode auth login`, which
   // would require opencode to be on PATH and interactive stdin.
   private async saveProviderAuth(providerID: string, apiKey: string): Promise<void> {
-    const home = process.env.HOME
-    if (!home) {
-      vscode.window.showErrorMessage("OpenCode: cannot resolve $HOME to locate auth.json")
-      return
-    }
     const trimmedID = providerID.trim().replace(/\/+$/, "")
     if (!trimmedID) {
       vscode.window.showErrorMessage("OpenCode: providerID is required to save auth.")
@@ -946,7 +1151,16 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
       vscode.window.showErrorMessage("OpenCode: apiKey is required to save auth.")
       return
     }
+    if (this.backend?.kind === "pi") {
+      await this.savePiProviderAuth(trimmedID, trimmedKey)
+      return
+    }
 
+    const home = process.env.HOME
+    if (!home) {
+      vscode.window.showErrorMessage("OpenCode: cannot resolve $HOME to locate auth.json")
+      return
+    }
     const authPath = path.join(home, ".local", "share", "opencode", "auth.json")
     let existing: Record<string, unknown> = {}
     try {
@@ -982,6 +1196,114 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
       `Saved API key for "${trimmedID}" to ~/.local/share/opencode/auth.json (0600). Restart the opencode server to activate.`,
     )
   }
+
+  private async savePiProviderAuth(providerID: string, apiKey: string): Promise<void> {
+    const home = process.env.HOME
+    const envDir = process.env.PI_CODING_AGENT_DIR
+    const dir = envDir ? envDir.replace(/^~(?=\/|$)/, home ?? "") : path.join(home ?? "", ".pi", "agent")
+    const authPath = path.join(dir, "auth.json")
+
+    let existing: Record<string, unknown> = {}
+    try {
+      const raw = await fs.readFile(authPath, "utf8")
+      const parsed = JSON.parse(raw) as unknown
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        existing = parsed as Record<string, unknown>
+      }
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        vscode.window.showErrorMessage(
+          `OpenCode: failed to read ${authPath} (${(err as Error).message}). Refusing to overwrite.`,
+        )
+        return
+      }
+    }
+
+    existing[providerID] = { type: "api_key", key: apiKey }
+
+    await fs.mkdir(path.dirname(authPath), { recursive: true })
+    await fs.writeFile(authPath, JSON.stringify(existing, null, 2), { mode: 0o600 })
+    try {
+      await fs.chmod(authPath, 0o600)
+    } catch {
+      // Non-POSIX filesystem; chmod is a no-op.
+    }
+
+    vscode.window.showInformationMessage(
+      `Saved API key for "${providerID}" to ~/.pi/agent/auth.json (0600). Restart the pi backend to activate.`,
+    )
+  }
+
+  // Open a pi config file (~/.pi/agent/<file>, or the dir pointed to by
+  // PI_CODING_AGENT_DIR) so the user can edit it. `anchor` is the top-level
+  // key to jump the cursor to; `anchorLabel` is used in the "key not found"
+  // hint. Scaffolds a minimal file if missing.
+  private async openPiConfig(file: string, anchor: string, anchorLabel: string, scaffold: () => string): Promise<void> {
+    const home = process.env.HOME
+    const envDir = process.env.PI_CODING_AGENT_DIR
+    const dir = envDir ? envDir.replace(/^~(?=\/|$)/, home ?? "") : path.join(home ?? "", ".pi", "agent")
+    const configPath = path.join(dir, file)
+
+    let created = false
+    try {
+      await fs.access(configPath)
+    } catch {
+      await fs.mkdir(path.dirname(configPath), { recursive: true })
+      await fs.writeFile(configPath, scaffold(), "utf8")
+      created = true
+    }
+
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(configPath))
+    const editor = await vscode.window.showTextDocument(doc, { preview: false })
+
+    // Jump the cursor to the anchor key if present.
+    const anchorText = `"${anchor}"`
+    for (let i = 0; i < doc.lineCount; i++) {
+      const idx = doc.lineAt(i).text.indexOf(anchorText)
+      if (idx === -1) continue
+      const pos = new vscode.Position(i, idx)
+      editor.selection = new vscode.Selection(pos, pos)
+      editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter)
+      break
+    }
+
+    if (created) {
+      vscode.window.showInformationMessage(`Created ${file}. Edit the ${anchorLabel} section, save, then restart the pi backend.`)
+    } else if (!doc.getText().includes(anchorText)) {
+      vscode.window.showInformationMessage(`No "${anchor}" key found in ${file}.`)
+    }
+  }
+
+  // Open dsh's profile patch file (~/.dsh/profiles/<profile>/cordis.patch.yml)
+  // so the user can edit providers / mcp / skills. The profile name comes from
+  // the dsh.args config (`--profile acp`).
+  private async openDshConfig(): Promise<void> {
+    const args = getConfig().get<string[]>("dsh.args", ["--profile", "acp"])
+    const idx = args.indexOf("--profile")
+    const profile = idx !== -1 && idx + 1 < args.length ? args[idx + 1] : "acp"
+    const home = process.env.HOME
+    const envDir = process.env.DSH_HOME
+    const dir = envDir ? envDir.replace(/^~(?=\/|$)/, home ?? "") : path.join(home ?? "", ".dsh")
+    const configPath = path.join(dir, "profiles", profile, "cordis.patch.yml")
+
+    let created = false
+    try {
+      await fs.access(configPath)
+    } catch {
+      await fs.mkdir(path.dirname(configPath), { recursive: true })
+      await fs.writeFile(configPath, dshPatchScaffold(), "utf8")
+      created = true
+    }
+
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(configPath))
+    await vscode.window.showTextDocument(doc, { preview: false })
+
+    if (created) {
+      vscode.window.showInformationMessage(
+        `Created ${configPath}. Edit providers / mcp / skills, save, then restart the dsh backend.`,
+      )
+    }
+  }
 }
 
 type ConfigSection = "provider" | "mcp" | "plugin" | "skills"
@@ -991,7 +1313,7 @@ type ConfigSection = "provider" | "mcp" | "plugin" | "skills"
 // See https://opencode.ai/docs/config for the full schema.
 function configScaffold(): string {
   return `// opencode config. See https://opencode.ai/docs for the full schema.
-// After editing, save and run "OpenCode: Restart Server" for opencode to
+// After editing, save and run "Restart Server" for opencode to
 // pick up new providers / MCP servers / plugins / skills.
 {
   "$schema": "https://opencode.ai/config.json",
@@ -1041,6 +1363,90 @@ function configScaffold(): string {
     // "paths": ["/absolute/path/to/skills"]
   }
 }
+`
+}
+
+// Minimal scaffold for pi's settings.json, used when the user clicks
+// "Edit skills config" on the pi backend and the file doesn't exist yet.
+function piSettingsScaffold(): string {
+  return `// pi settings. See https://pi.dev/docs for the full schema.
+// pi scans the directories in "skills" for SKILL.md files.
+{
+  "$schema": "https://pi.dev/schemas/settings.schema.json",
+  "skills": [
+    // "/absolute/path/to/skills"
+  ]
+}
+`
+}
+
+// Scaffolds for pi's models.json / mcp.json, used when the user opens the
+// Providers / MCP tab edit action and the file doesn't exist yet.
+function piModelsScaffold(): string {
+  return `// pi custom providers. See https://pi.dev/docs for the full schema.
+{
+  "$schema": "https://pi.dev/schemas/models.schema.json",
+  "providers": {
+    // "my-provider": {
+    //   "baseUrl": "https://api.example.com/v1",
+    //   "api": "openai-completions",
+    //   "apiKey": "my-key",
+    //   "models": [
+    //     { "id": "my-model", "contextWindow": 200000, "maxTokens": 81920, "input": ["text"] }
+    //   ]
+    // }
+  }
+}
+`
+}
+
+function piMcpScaffold(): string {
+  return `// pi MCP servers. See https://pi.dev/docs for the full schema.
+{
+  "$schema": "https://pi.dev/schemas/mcp.schema.json",
+  "mcpServers": {
+    // "my-server": {
+    //   "command": "npx",
+    //   "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allow"],
+    //   "description": "My MCP server"
+    // }
+  }
+}
+`
+}
+
+// Scaffold for dsh's cordis.patch.yml, used when the user opens a config edit
+// action and the profile patch file doesn't exist yet.
+function dshPatchScaffold(): string {
+  return `# dsh profile patch. Providers / MCP / skills are declared here.
+# Providers (via the llm-pi-ai adapter, OpenAI-compatible):
+# - id: llm-pi-ai
+#   config:
+#     providers:
+#       my-provider:
+#         displayName: My Provider
+#         api: openai-completions
+#         baseURL: https://api.example.com/v1
+#         models:
+#           - id: my-model
+#             contextWindow: 200000
+#             maxTokens: 81920
+#
+# MCP servers:
+# - insert:
+#     - id: mcp-my-server
+#       name: '@deepseek-ai/dsh-mcp-client'
+#       config:
+#         serverName: my-server
+#         command: npx
+#         args: ['-y', '@modelcontextprotocol/server-filesystem', '/path']
+#
+# Skills (extra dirs; ~/.agents/skills is scanned automatically):
+# - id: skill-filesystem
+#   config:
+#     customSkillDirs:
+#       - /absolute/path/to/skills
+[]
 `
 }
 

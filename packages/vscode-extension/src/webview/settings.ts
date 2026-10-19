@@ -5,10 +5,11 @@
 //
 // Kept in its own module so main.ts stays focused on chat/streaming.
 // Depends on the host `vscode.postMessage` bridge (for opening the config
-// file editor and skill contents) plus an OpencodeClient (for HTTP calls
+// file editor and skill contents) plus a BackendClient (for RPC calls
 // against the running server). Both are injected through `initSettings`.
 
-import type { McpStatus, OpencodeClient, ProviderInfo, SkillInfo } from "./sdk"
+import type { McpStatus, ProviderInfo, SkillInfo } from "../types"
+import type { BackendClient } from "./client"
 
 export type SettingsTab = "mcp" | "skills" | "plugins" | "providers" | "settings"
 
@@ -17,13 +18,14 @@ type StatusSetter = (text: string) => void
 
 // Module-scoped bindings written once via initSettings(). Every render
 // function reads these; we keep them mutable so the client reference can
-// update across bootstraps (e.g. after "OpenCode: Restart Server").
+// update across bootstraps (e.g. after "Restart Server").
 let overlayEl: HTMLElement | null = null
 let bodyEl: HTMLElement | null = null
 let currentTab: SettingsTab | null = null
-let clientRef: OpencodeClient | undefined
+let clientRef: BackendClient | undefined
 let postMessage: PostMessage = () => {}
 let setStatus: StatusSetter = () => {}
+let backendKind: string = "opencode"
 
 /**
  * Wire the overlay DOM (tabs + close button) and remember dependencies.
@@ -51,9 +53,14 @@ export function initSettings(deps: {
   }
 }
 
-/** Called after `new OpencodeClient(...)` in bootstrap. */
-export function setSettingsClient(c: OpencodeClient | undefined) {
+/** Called after the BackendClient is created in bootstrap. */
+export function setSettingsClient(c: BackendClient | undefined) {
   clientRef = c
+}
+
+/** Called from bootstrap so provider-tab rendering can branch on backend. */
+export function setSettingsBackendKind(kind: string) {
+  backendKind = kind
 }
 
 export function isSettingsOpen(): boolean {
@@ -122,8 +129,8 @@ function renderSettingsSubTab() {
   const root = bodyEl
   root.innerHTML = ""
 
-  // ---- Section 1: Server connection --------------------------------
-  root.appendChild(renderServerConnectionSection())
+  // ---- Section 1: Backend switcher --------------------------------
+  root.appendChild(renderBackendSection())
 
   // ---- Section 2: Debug --------------------------------------------
   const section = document.createElement("div")
@@ -172,45 +179,212 @@ function renderSettingsSubTab() {
   postMessage({ type: "getDebug" })
 }
 
-// ---- Server connection section ----
+// ---- Backend switcher section ----
 //
-// Preload: on render we ask the host for the live URL via `getServerConfig`.
-// Host answers with `serverConfig { activeUrl, activeSource }`, which
-// main.ts forwards to `applyServerConfig` below to fill the banner and form.
-//
-// Commit: pressing Attach sends `attachToServer { url }`. The host verifies
-// the URL is an opencode server, records it in globalState, and reloads the
-// webview against it — or falls back to spawning fresh if verification fails.
+// Lists already-running opencode/dsh/pi processes on this machine. There are
+// no standalone switch buttons — each row carries its own action: "switch" to
+// an already-running backend, or "start & switch" when that backend has no
+// live process. Pressing it sends `switchBackend { kind }` and the host
+// reloads the panel against that backend (spawning it if it wasn't running).
 
-// DOM handles for the section, so applyServerConfig() (called from main.ts
-// with the host's reply) can update them without re-querying.
-let serverHostInput: HTMLInputElement | null = null
-let serverPortInput: HTMLInputElement | null = null
-// Live connection banner: hostname + port + source badge. Rendered above the
-// form so the user always sees the URL the webview is currently talking to.
-let activeConnectionEl: HTMLElement | null = null
+const BACKEND_KINDS = ["opencode", "dsh", "pi"] as const
+const BACKEND_LABELS: Record<string, string> = { opencode: "opencode", dsh: "dsh", pi: "pi" }
+const SOURCE_LABELS: Record<string, string> = {
+  external: "external attach",
+  reattached: "reattached",
+  spawned: "spawned",
+}
 
-function renderServerConnectionSection(): HTMLElement {
+let backendActiveEl: HTMLElement | null = null
+let backendListEl: HTMLElement | null = null
+let backendCurrent: string | null = null
+
+function renderBackendSection(): HTMLElement {
   const section = document.createElement("div")
   section.className = "settings-section"
 
   const heading = document.createElement("div")
   heading.className = "settings-heading"
-  heading.textContent = "Server connection"
+  heading.textContent = "Backend"
   section.appendChild(heading)
 
-  // Live "Currently connected to …" banner. Ships bold/monospaced so it
-  // reads at a glance and doesn't blend into the surrounding hints.
-  activeConnectionEl = document.createElement("div")
-  activeConnectionEl.className = "settings-status"
-  activeConnectionEl.style.margin = "10px 0 4px 0"
-  activeConnectionEl.style.padding = "8px 10px"
-  activeConnectionEl.style.border = "1px solid var(--vscode-panel-border, rgba(128,128,128,0.3))"
-  activeConnectionEl.style.borderRadius = "4px"
-  activeConnectionEl.textContent = "Currently connected to: (waiting…)"
-  section.appendChild(activeConnectionEl)
+  backendActiveEl = document.createElement("div")
+  backendActiveEl.className = "settings-status"
+  backendActiveEl.style.margin = "4px 0 2px 0"
+  backendActiveEl.textContent = "Active backend: …"
+  section.appendChild(backendActiveEl)
 
-  // Host + port inputs. Small inline grid to keep them next to each other.
+  const hint = document.createElement("div")
+  hint.className = "settings-hint"
+  hint.textContent =
+    "Processes detected on this machine. Use each row's button to switch to a running backend, or start one that isn't running. To reach a remote or tunneled opencode server that isn't listed here, attach by URL below."
+  section.appendChild(hint)
+
+  backendListEl = document.createElement("div")
+  backendListEl.style.marginTop = "2px"
+  section.appendChild(backendListEl)
+
+  section.appendChild(renderAttachEntry())
+
+  postMessage({ type: "getBackends" })
+  return section
+}
+
+/** Called from main.ts when the host replies with `backendsSnapshot`. */
+export function applyBackendsSnapshot(
+  current: string,
+  processes: Array<{ kind: string; pid: number; label: string; port?: number; hostname?: string }>,
+  activeUrl?: string,
+  activeSource?: "spawned" | "reattached" | "external",
+) {
+  backendCurrent = current
+  if (backendActiveEl) {
+    const label = BACKEND_LABELS[current] ?? current
+    const hostPort = hostPortFromUrl(activeUrl)
+    const source = SOURCE_LABELS[activeSource ?? ""] ?? "connected"
+    backendActiveEl.textContent = hostPort
+      ? `Active backend: ${label} · ${hostPort} (${source})`
+      : `Active backend: ${label}`
+  }
+
+  const listEl = backendListEl
+  if (!listEl) return
+  listEl.innerHTML = ""
+
+  const activePort = portFromUrl(activeUrl)
+
+  for (const kind of BACKEND_KINDS) {
+    const list = processes.filter((p) => p.kind === kind)
+    const isCurrentKind = kind === current
+
+    if (list.length === 0) {
+      listEl.appendChild(
+        makeBackendRow(
+          BACKEND_LABELS[kind],
+          "(not running)",
+          isCurrentKind ? "当前" : "启动并切换",
+          isCurrentKind,
+          () => switchToBackend(kind),
+          true,
+        ),
+      )
+      continue
+    }
+
+    list.forEach((p, i) => {
+      // opencode 可精确 attach：多个进程时用端口匹配当前连接；单进程时
+      // kind 即当前。pi/dsh 已由后端过滤到只剩自己 spawn 的那个进程。
+      const isCurrent =
+        isCurrentKind && (list.length === 1 || (activePort !== undefined && p.port === activePort))
+      listEl.appendChild(
+        makeBackendRow(
+          i === 0 ? BACKEND_LABELS[kind] : "",
+          `pid ${p.pid} — ${p.label}`,
+          isCurrent ? "当前" : "切换",
+          isCurrent,
+          () => switchToBackend(kind, p.pid),
+        ),
+      )
+    })
+  }
+}
+
+function portFromUrl(url: string | undefined): number | undefined {
+  if (!url) return undefined
+  try {
+    const port = new URL(url).port
+    return port ? Number(port) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function hostPortFromUrl(url: string | undefined): string | undefined {
+  if (!url) return undefined
+  try {
+    const u = new URL(url)
+    const port = u.port || (u.protocol === "https:" ? "443" : "80")
+    return `${u.hostname}:${port}`
+  } catch {
+    return url
+  }
+}
+
+function switchToBackend(kind: string, pid?: number) {
+  postMessage({ type: "switchBackend", kind, pid })
+  setStatus(`Switching to ${BACKEND_LABELS[kind]}…`)
+}
+
+function makeBackendRow(
+  name: string,
+  infoText: string,
+  btnText: string,
+  disabled: boolean,
+  onClick: () => void,
+  dimmed = false,
+): HTMLElement {
+  const row = document.createElement("div")
+  row.style.display = "flex"
+  row.style.alignItems = "center"
+  row.style.gap = "8px"
+  row.style.marginTop = "3px"
+
+  const nameEl = document.createElement("span")
+  nameEl.style.minWidth = "70px"
+  nameEl.style.opacity = "0.7"
+  nameEl.textContent = name
+  row.appendChild(nameEl)
+
+  const info = document.createElement("span")
+  info.style.flex = "1"
+  if (dimmed) {
+    info.style.opacity = "0.45"
+  } else {
+    info.style.fontFamily = "var(--vscode-editor-font-family, monospace)"
+    info.style.fontSize = "0.92em"
+    if (disabled) info.style.color = "var(--vscode-textLink-foreground, #3794ff)"
+  }
+  info.textContent = infoText
+  row.appendChild(info)
+
+  const btn = document.createElement("button")
+  btn.className = "pill"
+  btn.type = "button"
+  btn.textContent = btnText
+  btn.disabled = disabled
+  if (!disabled) btn.addEventListener("click", onClick)
+  row.appendChild(btn)
+
+  return row
+}
+
+// ---- Attach to server (collapsed, lives inside the Backend section) ----
+//
+// The process list above only shows opencode servers found on this machine.
+// This entry covers the case that list can't: attaching to a remote or
+// tunneled opencode URL. Pressing Attach sends `attachToServer { url }`; the
+// host verifies it's opencode, records it in globalState, and reloads — or
+// falls back to spawning fresh if verification fails.
+
+let attachHostInput: HTMLInputElement | null = null
+let attachPortInput: HTMLInputElement | null = null
+
+function renderAttachEntry(): HTMLElement {
+  const wrap = document.createElement("div")
+  wrap.style.marginTop = "10px"
+
+  const formEl = document.createElement("div")
+  formEl.style.display = "none"
+
+  const toggle = document.createElement("button")
+  toggle.className = "pill"
+  toggle.type = "button"
+  toggle.textContent = "Attach to server…"
+  toggle.addEventListener("click", () => {
+    formEl.style.display = formEl.style.display === "none" ? "" : "none"
+  })
+  wrap.appendChild(toggle)
+
   const grid = document.createElement("div")
   grid.style.display = "flex"
   grid.style.gap = "8px"
@@ -225,13 +399,13 @@ function renderServerConnectionSection(): HTMLElement {
   hostLabel.className = "provider-form-label"
   hostLabel.textContent = "Hostname"
   hostField.appendChild(hostLabel)
-  serverHostInput = document.createElement("input")
-  serverHostInput.type = "text"
-  serverHostInput.className = "provider-form-input"
-  serverHostInput.placeholder = "127.0.0.1"
-  serverHostInput.value = "127.0.0.1"
-  serverHostInput.spellcheck = false
-  hostField.appendChild(serverHostInput)
+  attachHostInput = document.createElement("input")
+  attachHostInput.type = "text"
+  attachHostInput.className = "provider-form-input"
+  attachHostInput.placeholder = "127.0.0.1"
+  attachHostInput.value = "127.0.0.1"
+  attachHostInput.spellcheck = false
+  hostField.appendChild(attachHostInput)
   grid.appendChild(hostField)
 
   const portField = document.createElement("label")
@@ -241,17 +415,17 @@ function renderServerConnectionSection(): HTMLElement {
   portLabel.className = "provider-form-label"
   portLabel.textContent = "Port"
   portField.appendChild(portLabel)
-  serverPortInput = document.createElement("input")
-  serverPortInput.type = "number"
-  serverPortInput.className = "provider-form-input"
-  serverPortInput.placeholder = "4096"
-  serverPortInput.value = "4096"
-  serverPortInput.min = "1"
-  serverPortInput.max = "65535"
-  portField.appendChild(serverPortInput)
+  attachPortInput = document.createElement("input")
+  attachPortInput.type = "number"
+  attachPortInput.className = "provider-form-input"
+  attachPortInput.placeholder = "4096"
+  attachPortInput.value = "4096"
+  attachPortInput.min = "1"
+  attachPortInput.max = "65535"
+  portField.appendChild(attachPortInput)
   grid.appendChild(portField)
 
-  section.appendChild(grid)
+  formEl.appendChild(grid)
 
   const actions = document.createElement("div")
   actions.className = "settings-actions"
@@ -263,108 +437,35 @@ function renderServerConnectionSection(): HTMLElement {
   attachBtn.addEventListener("click", () => submitAttach())
   actions.appendChild(attachBtn)
 
-  section.appendChild(actions)
+  formEl.appendChild(actions)
 
-  // Fire off the request for current config; response goes through
-  // main.ts → applyServerConfig(). If we never get a reply (e.g. because
-  // the host lives in a different extension host process) the form still
-  // works with the built-in defaults (127.0.0.1:4096).
-  postMessage({ type: "getServerConfig" })
-
-  return section
+  wrap.appendChild(formEl)
+  return wrap
 }
 
 function submitAttach() {
-  if (!serverHostInput || !serverPortInput) return
-  const host = serverHostInput.value.trim() || "127.0.0.1"
-  const portStr = serverPortInput.value.trim()
+  if (!attachHostInput || !attachPortInput) return
+  const host = attachHostInput.value.trim() || "127.0.0.1"
+  const portStr = attachPortInput.value.trim()
   const port = parseInt(portStr, 10)
   if (!Number.isFinite(port) || port < 1 || port > 65535) {
     setStatus("Port must be a number between 1 and 65535.")
-    serverPortInput.focus()
+    attachPortInput.focus()
     return
   }
   // Basic hostname sanity check — reject spaces / slashes / schemes so the
   // resulting URL is well-formed. IPv6 hosts must already be wrapped in [].
   if (/[\s/]/.test(host) || /^https?:/i.test(host)) {
     setStatus("Enter a plain hostname (e.g. 127.0.0.1), no scheme or path.")
-    serverHostInput.focus()
+    attachHostInput.focus()
     return
   }
   const url = `http://${host}:${port}`
-  // No more "external mode" concept — we just tell the host "prefer this
-  // URL from now on". Host verifies it's opencode, if so records it as the
-  // remembered last-server and reloads. If it isn't reachable / isn't
-  // opencode, host falls back to spawn as usual (same policy as startup).
+  // Just tell the host "prefer this URL from now on". Host verifies it's
+  // opencode, if so records it as the remembered last-server and reloads.
+  // If it isn't reachable / isn't opencode, host falls back to spawn.
   postMessage({ type: "attachToServer", url })
   setStatus(`Attaching to ${url}…`)
-}
-
-/** Called from main.ts when the host replies with `serverConfig`.
- *  Prefills the Hostname/Port inputs from the live URL and updates the
- *  "Currently connected to …" banner. Safe to call multiple times. */
-export function applyServerConfig(
-  activeUrl?: string,
-  activeSource?: "spawned" | "reattached" | "external",
-) {
-  // Prefill the Attach form from the live URL — hitting Attach on it
-  // just pins the current connection. When there is no live URL yet the
-  // form keeps whatever defaults were set on render (127.0.0.1:4096).
-  if (activeUrl) {
-    let host = "127.0.0.1"
-    let port = "4096"
-    try {
-      const u = new URL(activeUrl)
-      if (u.hostname) host = u.hostname
-      if (u.port) port = u.port
-      else if (u.protocol === "https:") port = "443"
-      else if (u.protocol === "http:") port = "80"
-    } catch {
-      /* keep defaults */
-    }
-    if (serverHostInput) serverHostInput.value = host
-    if (serverPortInput) serverPortInput.value = port
-  }
-
-  // Live-connection banner. Render as `host:port (source)` with the source
-  // spelled out in human words. If we don't have an active URL yet the
-  // webview just booted — show a neutral placeholder.
-  if (activeConnectionEl) {
-    if (activeUrl) {
-      let hostPort = activeUrl
-      try {
-        const u = new URL(activeUrl)
-        const hp = u.port || (u.protocol === "https:" ? "443" : "80")
-        hostPort = `${u.hostname}:${hp}`
-      } catch {
-        /* keep raw url */
-      }
-      const sourceLabel =
-        activeSource === "external"
-          ? "external attach"
-          : activeSource === "reattached"
-            ? "reattached to previous server"
-            : activeSource === "spawned"
-              ? "spawned by extension"
-              : "connected"
-      activeConnectionEl.innerHTML = ""
-      const label = document.createElement("span")
-      label.textContent = "Currently connected to: "
-      const code = document.createElement("strong")
-      code.style.fontFamily = "var(--vscode-editor-font-family, monospace)"
-      code.textContent = hostPort
-      const badge = document.createElement("span")
-      badge.style.marginLeft = "8px"
-      badge.style.opacity = "0.75"
-      badge.style.fontSize = "0.9em"
-      badge.textContent = `(${sourceLabel})`
-      activeConnectionEl.appendChild(label)
-      activeConnectionEl.appendChild(code)
-      activeConnectionEl.appendChild(badge)
-    } else {
-      activeConnectionEl.textContent = "Currently connected to: (no live connection yet)"
-    }
-  }
 }
 
 // ---- MCP tab ----
@@ -374,6 +475,9 @@ async function renderMcpTab() {
   const root = bodyEl
   const statuses = await clientRef.getMcpStatus()
   root.innerHTML = ""
+
+  const isPi = backendKind === "pi"
+  const isDsh = backendKind === "dsh"
 
   const toolbar = document.createElement("div")
   toolbar.className = "settings-toolbar"
@@ -398,7 +502,11 @@ async function renderMcpTab() {
   if (names.length === 0) {
     const empty = document.createElement("div")
     empty.className = "settings-empty"
-    empty.innerHTML = `No MCP servers configured. Click <strong>+ Add MCP Server</strong> to edit opencode.jsonc.`
+    empty.innerHTML = isPi
+      ? `No MCP servers configured. Click <strong>+ Add MCP Server</strong> to edit <code>~/.pi/agent/mcp.json</code>.`
+      : isDsh
+        ? `No MCP servers configured. Click <strong>+ Add MCP Server</strong> to edit <code>~/.dsh/profiles/acp/cordis.patch.yml</code>.`
+        : `No MCP servers configured. Click <strong>+ Add MCP Server</strong> to edit opencode.jsonc.`
     root.appendChild(empty)
     return
   }
@@ -433,17 +541,22 @@ function renderMcpCard(name: string, s: McpStatus): HTMLElement {
   actions.className = "mcp-actions"
   const isConnected = s.status === "connected"
   const isFailed = s.status === "failed" || s.status === "needs_client_registration"
+  // pi has no MCP runtime RPC: its servers render as "configured" with no
+  // enable/disable toggle, just an edit action into mcp.json.
+  const isConfigured = s.status === "configured"
 
-  actions.appendChild(
-    mcpIconBtn(isConnected ? "↻" : isFailed ? "↻" : "▶", isConnected ? "Reconnect" : isFailed ? "Retry" : "Enable (runtime)", async () => {
-      try {
-        await clientRef!.mcpConnect(name)
-        await renderMcpTab()
-      } catch (err) {
-        setStatus(`MCP ${name}: ${(err as Error).message}`)
-      }
-    }),
-  )
+  if (!isConfigured) {
+    actions.appendChild(
+      mcpIconBtn(isConnected ? "↻" : isFailed ? "↻" : "▶", isConnected ? "Reconnect" : isFailed ? "Retry" : "Enable (runtime)", async () => {
+        try {
+          await clientRef!.mcpConnect(name)
+          await renderMcpTab()
+        } catch (err) {
+          setStatus(`MCP ${name}: ${(err as Error).message}`)
+        }
+      }),
+    )
+  }
   if (isConnected) {
     actions.appendChild(
       mcpIconBtn("◼", "Disable (runtime)", async () => {
@@ -457,7 +570,7 @@ function renderMcpCard(name: string, s: McpStatus): HTMLElement {
     )
   }
   actions.appendChild(
-    mcpIconBtn("✎", "Edit in opencode.jsonc", () =>
+    mcpIconBtn("✎", isConfigured ? (backendKind === "dsh" ? "Edit in cordis.patch.yml" : "Edit in mcp.json") : "Edit in opencode.jsonc", () =>
       postMessage({ type: "openMcpConfig", name }),
     ),
   )
@@ -490,6 +603,7 @@ function mcpStatusLabel(s: McpStatus): string {
   switch (s.status) {
     case "connected": return "connected"
     case "disabled": return "disabled"
+    case "configured": return "configured"
     case "failed": return "failed"
     case "needs_auth": return "needs auth"
     case "needs_client_registration": return "needs client registration"
@@ -637,6 +751,9 @@ async function renderProvidersTab() {
   const listing = await clientRef.getProviderList()
   root.innerHTML = ""
 
+  const isPi = backendKind === "pi"
+  const isDsh = backendKind === "dsh"
+
   const toolbar = document.createElement("div")
   toolbar.className = "settings-toolbar"
 
@@ -650,6 +767,14 @@ async function renderProvidersTab() {
   editBtn.textContent = "✎ Edit provider config"
   editBtn.addEventListener("click", () => postMessage({ type: "openProviderConfig" }))
   toolbar.appendChild(editBtn)
+
+  // pi/dsh have no custom-provider form (the opencode "Add custom provider"
+  // form writes opencode.jsonc, which neither reads). Providers are editable
+  // via their config files (pi models.json / dsh cordis.patch.yml), so hide
+  // only the add form and keep "Edit provider config".
+  if (isPi || isDsh) {
+    addBtn.hidden = true
+  }
 
   const refreshBtn = document.createElement("button")
   refreshBtn.className = "pill"
@@ -837,6 +962,14 @@ function fillProviderBody(body: HTMLElement, p: ProviderInfo) {
     body.appendChild(line)
   }
 
+  // pi has no per-provider model list over RPC (get_available_models is empty
+  // until a provider is authenticated). Instead of a dead "No models exposed."
+  // line, offer the API-key form so the user can configure the provider here.
+  if (backendKind === "pi") {
+    mountPiApiKeyForm(body, p)
+    return
+  }
+
   const models = p.models ?? {}
   const ids = Object.keys(models).sort()
   if (ids.length === 0) {
@@ -865,6 +998,52 @@ function fillProviderBody(body: HTMLElement, p: ProviderInfo) {
     list.appendChild(row)
   }
   body.appendChild(list)
+}
+
+// pi-specific API-key entry form. pi stores keys in ~/.pi/agent/auth.json
+// (format: { "<provider-id>": { "type": "api_key", "key": "..." } }). There's
+// no pi RPC to set auth, so the webview posts `saveProviderAuth` and the host
+// writes the file directly.
+function mountPiApiKeyForm(body: HTMLElement, p: ProviderInfo) {
+  const form = document.createElement("div")
+  form.className = "provider-kv"
+  form.style.cssText = "display:flex;align-items:center;gap:8px;margin-top:4px;cursor:default"
+
+  const key = document.createElement("span")
+  key.className = "provider-kv-key"
+  key.textContent = "API key:"
+  form.appendChild(key)
+
+  const input = document.createElement("input")
+  input.type = "password"
+  input.placeholder = `Saved to ~/.pi/agent/auth.json`
+  input.style.cssText = "flex:1;min-width:0"
+  form.appendChild(input)
+
+  const save = document.createElement("button")
+  save.className = "pill"
+  save.type = "button"
+  save.textContent = "Save"
+  form.appendChild(save)
+
+  const doSave = () => {
+    const value = input.value.trim()
+    if (!value) return
+    postMessage({ type: "saveProviderAuth", providerID: p.id, apiKey: value })
+  }
+  save.addEventListener("click", (e) => {
+    e.stopPropagation()
+    doSave()
+  })
+  input.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return
+    e.stopPropagation()
+    doSave()
+  })
+  // Clicking inside the form shouldn't collapse the card body.
+  form.addEventListener("click", (e) => e.stopPropagation())
+
+  body.appendChild(form)
 }
 
 // Render an api-key row with a mask/reveal toggle. Default is masked so a

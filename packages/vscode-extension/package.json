@@ -2,7 +2,7 @@
   "name": "opencode-vscode",
   "displayName": "OpenCode",
   "description": "OpenCode chat inside VSCode. Talks to a local opencode server over its HTTP API.",
-  "version": "0.26.29",
+  "version": "0.26.42",
   "private": true,
   "publisher": "opencode-ai",
   "engines": {
@@ -35,7 +35,7 @@
     "commands": [
       {
         "command": "opencode.open",
-        "title": "OpenCode: Open Chat Panel",
+        "title": "Open Chat Panel",
         "category": "OpenCode"
       },
       {
@@ -52,23 +52,23 @@
       },
       {
         "command": "opencode.reload",
-        "title": "OpenCode: Reload Panel",
+        "title": "Reload Panel",
         "category": "OpenCode",
         "icon": "$(refresh)"
       },
       {
         "command": "opencode.restartServer",
-        "title": "OpenCode: Restart Server",
+        "title": "Restart Server",
         "category": "OpenCode"
       },
       {
         "command": "opencode.showLogs",
-        "title": "OpenCode: Show Logs",
+        "title": "Show Logs",
         "category": "OpenCode"
       },
       {
         "command": "opencode.showSettings",
-        "title": "OpenCode: Show Settings",
+        "title": "Show Settings",
         "category": "OpenCode",
         "icon": "$(settings-gear)"
       },
@@ -125,6 +125,52 @@
           "type": "string",
           "default": "",
           "description": "Default model in the form providerID/modelID (empty = server default)."
+        },
+        "opencode.backend": {
+          "type": "string",
+          "enum": ["opencode", "dsh", "pi"],
+          "default": "opencode",
+          "enumDescriptions": [
+            "Drive opencode through its private HTTP API (full feature set).",
+            "Drive deepseek-harness (dsh) through the Agent Client Protocol.",
+            "Drive pi through its headless JSONL RPC protocol."
+          ]
+        },
+        "opencode.dsh.command": {
+          "type": "string",
+          "default": "dsh",
+          "description": "Command used to launch dsh for the ACP backend (defaults to 'dsh' on PATH)."
+        },
+        "opencode.dsh.args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": ["--profile", "acp"],
+          "description": "Extra arguments passed to the dsh command (e.g. [\"--profile\", \"acp\"])."
+        },
+        "opencode.dsh.cwd": {
+          "type": "string",
+          "default": "",
+          "description": "Working directory for the dsh process (empty = workspace folder)."
+        },
+        "opencode.pi.command": {
+          "type": "string",
+          "default": "pi",
+          "description": "Command used to launch pi for the RPC backend (defaults to 'pi' on PATH)."
+        },
+        "opencode.pi.args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": ["--mode", "rpc", "--no-session"],
+          "description": "Extra arguments passed to the pi command."
+        },
+        "opencode.pi.cwd": {
+          "type": "string",
+          "default": "",
+          "description": "Working directory for the pi process (empty = workspace folder)."
         }
       }
     },
@@ -202,8 +248,10 @@
     "typescript": "catalog:"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "1.4.0",
     "highlight.js": "11",
     "markdown-it": "14",
-    "markdown-it-task-lists": "2"
+    "markdown-it-task-lists": "2",
+    "yaml": "^2.9.0"
   }
 }

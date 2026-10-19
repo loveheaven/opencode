@@ -9,7 +9,7 @@
 // `setSlashCommands`) and the textarea. It renders its own floating DOM
 // element so the palette can escape the composer's layout.
 
-import type { CommandInfo } from "./sdk"
+import type { CommandInfo } from "../types"
 
 let inputEl: HTMLTextAreaElement | null = null
 let commands: readonly CommandInfo[] = []

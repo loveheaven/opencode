@@ -3,5 +3,20 @@ src/**
 tsconfig.json
 **/*.map
 **/*.ts
+
+# Everything the extension needs is bundled into dist/extension.js by
+# `bun build` (see package.json build script). node_modules here is a set of
+# workspace symlinks into the monorepo root, and vsce FOLLOWS symlinks while
+# walking the dependency tree — which dragged all of packages/app into the
+# .vsix (19k files) and then crashed on packages/app/node_modules/virtua.
+# Excluding it is both correct and the fix for the packaging error. Matching
+# the bare name as well as the glob, because the glob alone didn't exclude it.
+node_modules
 node_modules/**
-!dist/extension.js
+**/node_modules/**
+
+# Stale packages from earlier builds.
+*.vsix
+
+# Dev-only docs/manifests that don't need to ship.
+dist/webview/main.js.map

@@ -18,7 +18,11 @@
     <div id="composer-resizer" role="separator" aria-orientation="horizontal" title="Drag to resize"></div>
     <footer id="composer">
       <div id="attachments-strip" class="attachments-strip" hidden></div>
-      <textarea id="input" rows="3" placeholder="Ask opencode… (Cmd/Ctrl+Enter to send · paste or drop images · type / for commands)"></textarea>
+      <!-- Neutral default on purpose: main.ts's applyBackendIdentity() rewrites
+           this to "Ask <backend>…" as soon as bootstrap lands. Hardcoding a
+           backend name here would flash the wrong one, and would lie outright
+           after a switch to pi/dsh. -->
+      <textarea id="input" rows="3" placeholder="Send a message… (Cmd/Ctrl+Enter to send · paste or drop images · type / for commands)"></textarea>
       <div id="composer-actions">
         <div id="agent-model" class="pill-row"></div>
         <div class="spacer"></div>

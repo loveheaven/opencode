@@ -5,14 +5,15 @@
 // chat state — the drawer just renders that data and forwards user actions
 // through the injected handlers.
 
-import type { OpencodeClient, SessionInfo } from "./sdk"
+import type { Session } from "../model"
+import type { BackendClient } from "./client"
 
 type Deps = {
   drawer: HTMLElement
   list: HTMLElement
-  getClient: () => OpencodeClient | undefined
-  getSessions: () => SessionInfo[]
-  setSessions: (list: SessionInfo[]) => void
+  getClient: () => BackendClient | undefined
+  getSessions: () => Session[]
+  setSessions: (list: Session[]) => void
   getCurrentSessionID: () => string | undefined
   onSelect: (id: string) => Promise<void> | void
   onNewSessionNeeded: () => Promise<void> | void

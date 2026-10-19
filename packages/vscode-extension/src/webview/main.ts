@@ -8,17 +8,15 @@
 // and DOM refs live in shared.ts so those modules don't need to receive
 // them as init params.
 
+import { BackendClient } from "./client"
 import {
-  OpencodeClient,
-  type HostBridge,
-} from "./sdk"
-import {
+  applyBackendsSnapshot,
   applyDebugState,
-  applyServerConfig,
   closeSettings,
   initSettings,
   isSettingsOpen,
   openSettings,
+  setSettingsBackendKind,
   setSettingsClient,
   type SettingsTab,
 } from "./settings"
@@ -56,7 +54,7 @@ import {
 import { initQuestions, renderQuestions } from "./questions"
 import { initEvents, subscribeEvents } from "./events"
 import { noteObservedUpdated, startSyncPoll, syncNow } from "./sync"
-import { getClient, initSharedRefs, log, refs, setClient, setStatus, state } from "./shared"
+import { backendLabel, getClient, initSharedRefs, log, refs, setClient, setStatus, state } from "./shared"
 
 // Extension-host bridge (webview → vscode)
 declare function acquireVsCodeApi(): {
@@ -66,21 +64,18 @@ declare function acquireVsCodeApi(): {
 }
 const vscode = acquireVsCodeApi()
 
-// -------- Host bridge: routes fetch/SSE via postMessage to the extension host --------
-type HttpResolver = (value: { ok: boolean; status: number; body: string; headers: Record<string, string> }) => void
-type HttpRejector = (reason: Error) => void
-const pendingHttp = new Map<string, { resolve: HttpResolver; reject: HttpRejector }>()
-type SseHandlers = { onData: (data: string) => void; onError: (message: string) => void; onEnd: () => void }
-const pendingSse = new Map<string, SseHandlers>()
+// -------- Host bridge --------
+// The BackendClient routes every backend call through `backend.rpc` postMessage
+// and receives `backend.result` / `backend.update` / `backend.status` pushes.
+// window.confirm/prompt are disabled in VSCode webviews — route those through
+// the extension host, which uses native VSCode modals.
+const pendingConfirm = new Map<string, (result: boolean) => void>()
+const pendingInput = new Map<string, (value: string | undefined) => void>()
 let bridgeSeq = 0
 function nextBridgeId(prefix: string): string {
   bridgeSeq += 1
   return `${prefix}_${Date.now().toString(36)}_${bridgeSeq}`
 }
-// window.confirm/prompt are disabled in VSCode webviews. Route through the
-// extension host, which uses native VSCode modals.
-const pendingConfirm = new Map<string, (result: boolean) => void>()
-const pendingInput = new Map<string, (value: string | undefined) => void>()
 function askConfirm(message: string, destructive = false): Promise<boolean> {
   return new Promise((resolve) => {
     const id = nextBridgeId("cfm")
@@ -94,25 +89,6 @@ function askInput(prompt: string, defaultValue = ""): Promise<string | undefined
     pendingInput.set(id, resolve)
     vscode.postMessage({ type: "input", id, prompt, defaultValue })
   })
-}
-
-const hostBridge: HostBridge = {
-  request(method, url, body, headers) {
-    return new Promise((resolve, reject) => {
-      const id = nextBridgeId("http")
-      pendingHttp.set(id, { resolve, reject })
-      vscode.postMessage({ type: "httpRequest", id, method, url, headers, body })
-    })
-  },
-  openSse(url, onData, onError, onEnd) {
-    const id = nextBridgeId("sse")
-    pendingSse.set(id, { onData, onError, onEnd })
-    vscode.postMessage({ type: "sseOpen", id, url })
-    return () => {
-      pendingSse.delete(id)
-      vscode.postMessage({ type: "sseClose", id })
-    }
-  },
 }
 
 const $ = (id: string) => document.getElementById(id) as HTMLElement
@@ -217,7 +193,7 @@ function setup() {
   refs.messages.addEventListener("click", onMessagesClick)
 
   window.addEventListener("message", onExtensionMessage)
-  setStatus("Waiting for opencode server…")
+  setStatus("Waiting for backend…")
 
   // Handshake: tell the host we're ready to receive messages. Under
   // remote-ssh / dev-containers the vscode-webview transport is async, so
@@ -239,7 +215,7 @@ function setup() {
   // or a filesystem hiccup during reap doesn't trip the message.
   setTimeout(() => {
     if (!getClient()) {
-      setStatus("Server not ready. Run “OpenCode: Restart Server” from the command palette.")
+      setStatus("Server not ready. Run “Restart Server” from the command palette.")
       renderEmptyState()
     }
   }, 60000)
@@ -248,6 +224,7 @@ function setup() {
 async function onExtensionMessage(event: MessageEvent) {
   const msg = event.data as { type: string } & Record<string, unknown>
   if (!msg || typeof msg !== "object") return
+  if (getClient()?.handleMessage(msg)) return
   switch (msg.type) {
     case "bootstrap":
       await bootstrap(msg as never)
@@ -270,40 +247,6 @@ async function onExtensionMessage(event: MessageEvent) {
     case "showSettings":
       openSettings((msg as unknown as { tab: SettingsTab }).tab)
       break
-    case "httpResponse": {
-      const pending = pendingHttp.get(msg.id as string)
-      if (!pending) return
-      pendingHttp.delete(msg.id as string)
-      pending.resolve({
-        ok: msg.ok as boolean,
-        status: msg.status as number,
-        body: (msg.body as string) ?? "",
-        headers: (msg.headers as Record<string, string>) ?? {},
-      })
-      return
-    }
-    case "httpError": {
-      const pending = pendingHttp.get(msg.id as string)
-      if (!pending) return
-      pendingHttp.delete(msg.id as string)
-      pending.reject(new Error((msg.message as string) ?? "http error"))
-      return
-    }
-    case "sseEvent": {
-      const h = pendingSse.get(msg.id as string)
-      h?.onData(msg.data as string)
-      return
-    }
-    case "sseError": {
-      const h = pendingSse.get(msg.id as string)
-      h?.onError((msg.message as string) ?? "sse error")
-      return
-    }
-    case "sseEnd": {
-      const h = pendingSse.get(msg.id as string)
-      h?.onEnd()
-      return
-    }
     case "confirmResponse": {
       const cb = pendingConfirm.get(msg.id as string)
       if (!cb) return
@@ -321,18 +264,43 @@ async function onExtensionMessage(event: MessageEvent) {
     case "debugState":
       applyDebugState(Boolean(msg.enabled))
       return
-    case "serverConfig": {
+    case "backendsSnapshot": {
+      const current = typeof msg.current === "string" ? (msg.current as string) : "opencode"
+      const processes = Array.isArray(msg.processes)
+        ? (msg.processes as Array<{ kind: string; pid: number; label: string; port?: number; hostname?: string }>)
+        : []
       const activeUrl = typeof msg.activeUrl === "string" ? (msg.activeUrl as string) : undefined
       const rawSource = typeof msg.activeSource === "string" ? (msg.activeSource as string) : undefined
       const activeSource: "spawned" | "reattached" | "external" | undefined =
         rawSource === "spawned" || rawSource === "reattached" || rawSource === "external" ? rawSource : undefined
-      applyServerConfig(activeUrl, activeSource)
+      applyBackendsSnapshot(current, processes, activeUrl, activeSource)
       return
     }
   }
 }
 
+// Point every chat-surface string that names the agent at the backend the host
+// actually built. index.html ships an "Ask opencode…" placeholder, and the
+// webview is never re-created on a backend switch — reload() rebuilds the
+// document from buildHtml(), but the placeholder is a static attribute, so a
+// pi session would keep advertising opencode. Called from bootstrap(), which
+// runs on every reload including the one a switch triggers.
+//
+// The suffix is duplicated verbatim from index.html on purpose: the hints are
+// capability-independent (composer shortcuts, not backend features), so the
+// only variable part is the agent name.
+const COMPOSER_HINT = "Cmd/Ctrl+Enter to send · paste or drop images · type / for commands"
+
+function applyBackendIdentity(kind: string) {
+  state.backendKind = kind
+  if (!refs.input) return
+  refs.input.placeholder = `Ask ${backendLabel()}… (${COMPOSER_HINT})`
+  refs.input.setAttribute("aria-label", `Message ${backendLabel()}`)
+}
+
 async function bootstrap(msg: {
+  backendKind: string
+  capabilities: Record<string, boolean>
   serverUrl: string
   directory: string
   defaultAgent: string
@@ -343,9 +311,16 @@ async function bootstrap(msg: {
   state.directory = msg.directory
   state.defaultAgent = msg.defaultAgent
   state.defaultModel = msg.defaultModel
-  const client = new OpencodeClient(msg.serverUrl, msg.directory, hostBridge)
+  const client = new BackendClient((m) => vscode.postMessage(m))
   setClient(client)
   setSettingsClient(client)
+  setSettingsBackendKind(msg.backendKind)
+  // Re-brand the chat surface for whichever backend the host ended up on.
+  // bootstrap() is the only place that learns the kind, and it re-runs on
+  // every reload — including the reload a backend switch triggers — so this
+  // is the right hook. Without it the composer keeps the index.html default
+  // ("Ask opencode…") in front of a pi/dsh session.
+  applyBackendIdentity(msg.backendKind)
 
   // Never let one failing preflight call blank the UI. allSettled + log any
   // errors, then render whatever we have.
@@ -556,7 +531,7 @@ async function sendPrompt() {
         model: state.model || undefined,
       })
     } else {
-      await client.promptAsync({
+      await client.prompt({
         sessionID: state.sessionID,
         text,
         attachments: attachments.map((a) => ({ mime: a.mime, url: a.url, filename: a.filename })),

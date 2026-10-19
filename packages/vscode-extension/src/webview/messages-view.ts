@@ -19,8 +19,8 @@
 // path/diff clicks to the extension host.
 
 import { escapeHtml, renderMarkdown } from "./markdown"
-import type { Message, MessageWithParts, Part, TokenUsage, ToolPart } from "./sdk"
-import { getClient, refs, state, type MessageEntry } from "./shared"
+import type { Message, MessageInfo, Part, TokenUsage, ToolPart } from "../model"
+import { backendLabel, getClient, refs, state, type MessageEntry } from "./shared"
 import { openLightbox } from "./lightbox"
 import { buildQuestionCard, clearQuestionDraft, findPendingQuestionForTool } from "./questions"
 
@@ -41,11 +41,12 @@ export function initMessagesView(deps: {
   onNewSessionCb = deps.onNewSession
 }
 
-/** Ingest a full message+parts blob from /session/:id/message list. */
-export function recordMessage(m: MessageWithParts) {
-  const existing = state.messages.get(m.info.id)
+/** Ingest a full message+parts blob from getMessages. */
+export function recordMessage(m: Message) {
+  const info: MessageInfo = m
+  const existing = state.messages.get(m.id)
   if (existing) {
-    existing.info = m.info
+    existing.info = info
     // reconcile parts by id
     for (const p of m.parts) {
       if (!existing.parts.has(p.id)) existing.partOrder.push(p.id)
@@ -56,12 +57,12 @@ export function recordMessage(m: MessageWithParts) {
   const partOrder = m.parts.map((p) => p.id)
   const parts = new Map<string, Part>()
   for (const p of m.parts) parts.set(p.id, p)
-  state.messages.set(m.info.id, { info: m.info, parts, partOrder })
-  state.messageOrder.push(m.info.id)
+  state.messages.set(m.id, { info, parts, partOrder })
+  state.messageOrder.push(m.id)
 }
 
 /** Update or insert a message record without touching its parts. */
-export function upsertMessage(info: Message) {
+export function upsertMessage(info: MessageInfo) {
   const existing = state.messages.get(info.id)
   if (existing) {
     existing.info = info
@@ -72,11 +73,8 @@ export function upsertMessage(info: Message) {
 }
 
 /** Insert or replace a single part; buffer if we haven't seen the parent yet. */
-export function upsertPart(sessionID: string, part: Part) {
+export function upsertPart(sessionID: string, messageID: string, part: Part) {
   if (sessionID !== state.sessionID) return
-  // Every part carries a parent messageID via partBase.messageID; but that field
-  // isn't part of our stripped types — the server does include it. Cast to unknown.
-  const messageID = (part as unknown as { messageID?: string }).messageID
   if (!messageID) return
   const entry = state.messages.get(messageID)
   if (!entry) {
@@ -430,7 +428,7 @@ function classifyError(err: { name?: string; message?: string; data?: unknown })
   return {
     kind: "generic",
     title: err.name || "APIError",
-    summary: inner || rawMessage || "The opencode server reported an error but did not include a message.",
+    summary: inner || rawMessage || `The ${backendLabel()} server reported an error but did not include a message.`,
     facts: status !== undefined ? [{ label: "Status", value: String(status) }] : [],
     advice: "Check the model/provider settings (Providers tab) and the OpenCode Output panel for the full response.",
     raw: haystack,
@@ -634,8 +632,7 @@ function buildErrorActions(c: ClassifiedError): HTMLElement | undefined {
   compactBtn.type = "button"
   compactBtn.className = "error-card-action primary"
   compactBtn.textContent = "Compact this session"
-  compactBtn.title =
-    "Ask opencode to summarise older history and auto-retry the last turn."
+  compactBtn.title = `Ask ${backendLabel()} to summarise older history and auto-retry the last turn.`
   compactBtn.addEventListener("click", async () => {
     const client = getClient()
     const sessionID = state.sessionID
@@ -1118,7 +1115,7 @@ async function copyToClipboard(text: string): Promise<boolean> {
   }
 }
 
-function agentLabel(info: Message): string {
+function agentLabel(info: MessageInfo): string {
   const agent = info.agent ?? ""
   const model = info.model?.modelID ?? ""
   if (agent && model) return `${agent} · ${model}`
@@ -1346,7 +1343,7 @@ function renderPart(part: Part, messageID: string, streaming = false): HTMLEleme
     // if the server ever adds a new status).
     const tp = part as ToolPart
     if (tp.tool === "question") {
-      const status = tp.state.status
+      const status = tp.status
       if (status === "running") {
         const req = findPendingQuestionForTool(messageID, tp.callID)
         if (req) return buildQuestionCard(req)
@@ -1426,10 +1423,10 @@ function renderPart(part: Part, messageID: string, streaming = false): HTMLEleme
 // running part and on parts without a `questions` input; callers fall
 // back to a placeholder or the generic tool card respectively.
 function renderAnsweredQuestionCard(part: ToolPart): HTMLElement | null {
-  const status = part.state.status
+  const status = part.status
   if (status !== "completed" && status !== "error") return null
 
-  const input = part.state.input as Record<string, unknown>
+  const input = part.input as Record<string, unknown>
   const rawQs = (input as { questions?: unknown }).questions
   if (!Array.isArray(rawQs) || rawQs.length === 0) return null
   const questions = rawQs as Array<{
@@ -1443,9 +1440,7 @@ function renderAnsweredQuestionCard(part: ToolPart): HTMLElement | null {
   // Answers land on the completed part's metadata (see
   // packages/opencode/src/tool/question.ts). On error the array is
   // absent — the card still shows what was asked as a record.
-  const meta = (part.state as { metadata?: unknown }).metadata as
-    | { answers?: unknown }
-    | undefined
+  const meta = part.metadata as { answers?: unknown } | undefined
   const answers: string[][] = Array.isArray(meta?.answers)
     ? (meta!.answers as unknown[]).map((a) => (Array.isArray(a) ? (a as unknown[]).map(String) : []))
     : []
@@ -1559,7 +1554,7 @@ function renderToolPart(part: ToolPart): HTMLElement {
   div.className = "tool"
   div.dataset.partId = part.id
 
-  const status = part.state.status
+  const status = part.status
   const target = toolTarget(part)
 
   // Header layout: icon · name · target · [actions | status]
@@ -1630,7 +1625,7 @@ function renderToolPart(part: ToolPart): HTMLElement {
 // glob/grep            → (nothing — no single obvious action; the body
 //                        already shows the matches and users expand for it)
 function renderToolHeaderActions(part: ToolPart): HTMLElement | undefined {
-  const input = part.state.input as Record<string, unknown>
+  const input = part.input as Record<string, unknown>
   const filePath = pickPath(input)
   const actions = document.createElement("span")
   actions.className = "tool-actions"
@@ -1650,7 +1645,7 @@ function renderToolHeaderActions(part: ToolPart): HTMLElement | undefined {
       )
       actions.appendChild(
         makeToolActionButton("Diff", "Show diff", () =>
-          showDiffForEdit(filePath, input, part.state as { metadata: Record<string, unknown> }),
+          showDiffForEdit(filePath, input, part.metadata),
         ),
       )
     }
@@ -1742,7 +1737,7 @@ function renderToolIconElement(part: ToolPart): HTMLElement {
   span.className = "tool-icon"
 
   if (isFileTool(part.tool)) {
-    const input = part.state.input as Record<string, unknown>
+    const input = part.input as Record<string, unknown>
     const filePath = pickPath(input)
     const info = filePath ? fileTypeInfo(filePath) : undefined
     if (info) {
@@ -1940,7 +1935,7 @@ function fileTypeInfo(filePath: string): { label: string; className: string; too
 }
 
 function toolTarget(part: ToolPart): string {
-  const input = part.state.input as Record<string, unknown>
+  const input = part.input as Record<string, unknown>
   const pick = (k: string) => (typeof input[k] === "string" ? (input[k] as string) : undefined)
   // Prefer workspace-relative paths in the header — absolute paths are noisy
   // and hide the useful suffix behind the ellipsis when the workspace root
@@ -1974,7 +1969,7 @@ function relativizeToWorkspace(p: string): string {
 
 function fillToolBody(body: HTMLElement, part: ToolPart) {
   body.innerHTML = ""
-  const input = part.state.input as Record<string, unknown>
+  const input = part.input as Record<string, unknown>
   const filePath =
     (typeof input.filePath === "string" && input.filePath) ||
     (typeof input.path === "string" && input.path) ||
@@ -2006,8 +2001,8 @@ function fillToolBody(body: HTMLElement, part: ToolPart) {
     body.appendChild(link)
   }
 
-  if (part.state.status === "completed") {
-    const output = (part.state as { output: string }).output ?? ""
+  if (part.status === "completed") {
+    const output = part.output ?? ""
     if (output) {
       const pre = document.createElement("pre")
       pre.textContent = output
@@ -2019,9 +2014,9 @@ function fillToolBody(body: HTMLElement, part: ToolPart) {
     // inline in the tool header via renderToolHeaderActions so users don't
     // have to expand the card first. See renderToolPart above.
   }
-  if (part.state.status === "error") {
+  if (part.status === "error") {
     const pre = document.createElement("pre")
-    pre.textContent = (part.state as { error: string }).error
+    pre.textContent = part.error ?? ""
     pre.style.color = "var(--vscode-errorForeground)"
     pre.style.whiteSpace = "pre-wrap"
     pre.style.margin = "6px 0 0 0"
@@ -2029,17 +2024,17 @@ function fillToolBody(body: HTMLElement, part: ToolPart) {
   }
 }
 
-function showDiffForEdit(filePath: string, input: Record<string, unknown>, partState: { metadata: Record<string, unknown> }) {
+function showDiffForEdit(filePath: string, input: Record<string, unknown>, meta: Record<string, unknown> | undefined) {
   // The `edit` tool stores oldString/newString in input, plus final content in
-  // state.metadata.contents when available. `write` stores full content in
+  // metadata.contents when available. `write` stores full content in
   // input.content and old contents in metadata.previousContent.
   let original = ""
   let modified = ""
   if (typeof input.oldString === "string") original = input.oldString
   if (typeof input.newString === "string") modified = input.newString
-  const meta = partState.metadata ?? {}
-  if (typeof meta.previousContent === "string") original = meta.previousContent
-  if (typeof meta.contents === "string") modified = meta.contents
+  const m = meta ?? {}
+  if (typeof m.previousContent === "string") original = m.previousContent
+  if (typeof m.contents === "string") modified = m.contents
   if (!original && typeof input.content === "string") modified = input.content
   postMessage({ type: "showDiff", path: filePath, original, modified, title: filePath })
 }

@@ -10,32 +10,34 @@
 //     sessions, current agent/model, busy flag, pending questions).
 //   • DOM refs (`refs.*`) are wired once by main.ts's setup(); modules read
 //     them but never re-query the DOM.
-//   • `getClient()` returns the current OpencodeClient (may be undefined
+//   • `getClient()` returns the current BackendClient (may be undefined
 //     during boot / after server restart). We keep it behind a getter so
 //     modules always see the latest reference after `setClient` reassigns.
 //   • `log` / `setStatus` are cheap logging helpers; they exist here so
 //     modules don't each need to receive them as init params.
 
-import type {
-  AgentInfo,
-  CommandInfo,
-  Message,
-  OpencodeClient,
-  Part,
-  ProviderInfo,
-  QuestionRequest,
-  SessionInfo,
-} from "./sdk"
+import type { MessageInfo, Part, QuestionRequest, Session } from "../model"
+import type { AgentInfo, CommandInfo, ProviderInfo } from "../types"
+import type { BackendClient } from "./client"
 
-export type MessageEntry = { info: Message; parts: Map<string, Part>; partOrder: string[] }
+export type MessageEntry = { info: MessageInfo; parts: Map<string, Part>; partOrder: string[] }
 
 export type State = {
   serverUrl: string
   directory: string
   defaultAgent: string
   defaultModel: string
+  /**
+   * Which backend the host is currently driving ("opencode" | "dsh" | "pi").
+   * Mirrors `BackendKind`, kept as a plain string so this file stays free of
+   * backend/ imports. Chat-surface copy that names the agent reads this so a
+   * backend switch doesn't leave "Ask opencode…" sitting in front of a pi
+   * session. Set from the host's bootstrap message; see applyBackendIdentity
+   * in main.ts.
+   */
+  backendKind: string
   sessionID?: string
-  sessions: SessionInfo[]
+  sessions: Session[]
   messages: Map<string, MessageEntry>
   messageOrder: string[]
   agents: AgentInfo[]
@@ -52,6 +54,7 @@ export const state: State = {
   directory: "",
   defaultAgent: "",
   defaultModel: "",
+  backendKind: "opencode",
   sessions: [],
   messages: new Map(),
   messageOrder: [],
@@ -64,14 +67,28 @@ export const state: State = {
   pendingQuestions: new Map(),
 }
 
+// Display name for the active backend, used anywhere the UI addresses the
+// agent by name. Separate from settings.ts's BACKEND_LABELS (which labels the
+// process-picker rows) because this one is read on the chat surface and needs
+// a sane fallback for an unknown kind rather than an empty cell.
+const BACKEND_DISPLAY_NAMES: Record<string, string> = {
+  opencode: "opencode",
+  dsh: "dsh",
+  pi: "pi",
+}
+
+export function backendLabel(): string {
+  return BACKEND_DISPLAY_NAMES[state.backendKind] ?? (state.backendKind || "the agent")
+}
+
 // Client is set once bootstrap finishes; a module reading it before that
 // gets `undefined` and should bail. Kept behind a getter so subsequent
 // bootstraps (server restart) don't leave stale references behind.
-let clientRef: OpencodeClient | undefined
-export function getClient(): OpencodeClient | undefined {
+let clientRef: BackendClient | undefined
+export function getClient(): BackendClient | undefined {
   return clientRef
 }
-export function setClient(c: OpencodeClient | undefined) {
+export function setClient(c: BackendClient | undefined) {
   clientRef = c
 }
 
