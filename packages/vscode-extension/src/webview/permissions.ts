@@ -288,7 +288,7 @@ async function autoApprove(sessionID: string, permissionID: string) {
 // Fire the /permissions/{id} POST. If the client isn't ready yet or the call
 // fails, retry a few times with backoff so the server never gets stuck on an
 // unanswered ask — that would loop back into another permission.asked event.
-async function sendPermissionResponse(_sessionID: string, permissionID: string, response: "once" | "always" | "reject") {
+async function sendPermissionResponse(sessionID: string, permissionID: string, response: "once" | "always" | "reject") {
   if (!deps) return
   if (respondedPermissions.has(permissionID)) {
     deps.log("permission already responded, skip", permissionID)
@@ -301,7 +301,7 @@ async function sendPermissionResponse(_sessionID: string, permissionID: string, 
     const client = deps.getClient()
     if (!client) continue
     try {
-      await client.respondPermission(permissionID, response)
+      await client.respondPermission(sessionID, permissionID, response)
       return
     } catch (err) {
       deps.log("respondPermission attempt failed", { permissionID, err })

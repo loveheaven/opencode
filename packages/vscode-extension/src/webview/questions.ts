@@ -233,7 +233,7 @@ export function buildQuestionCard(req: QuestionRequest): HTMLElement {
     submitBtn.disabled = true
     dismissBtn.disabled = true
     try {
-      await client.replyQuestion(req.id, answers)
+      await client.replyQuestion(req.sessionID, req.id, answers)
       questionDrafts.delete(draftKey)
       state.pendingQuestions.delete(req.id)
       renderQuestions()
@@ -250,7 +250,7 @@ export function buildQuestionCard(req: QuestionRequest): HTMLElement {
     submitBtn.disabled = true
     dismissBtn.disabled = true
     try {
-      await client.rejectQuestion(req.id)
+      await client.rejectQuestion(req.sessionID, req.id)
       questionDrafts.delete(draftKey)
       state.pendingQuestions.delete(req.id)
       renderQuestions()

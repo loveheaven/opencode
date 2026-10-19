@@ -18,6 +18,14 @@ import type {
 
 export type BackendKind = "opencode" | "dsh" | "pi"
 
+// Shared config for the opencode HTTP backend(s). `password` is only used by
+// the v2 server (which authenticates every route); the v1 backend ignores it.
+export type OpencodeConfig = {
+  baseUrl: string
+  directory: string
+  password?: string
+}
+
 // Which product-level configuration surfaces a backend exposes. These drive
 // which settings tabs the webview renders; a backend that cannot enumerate or
 // mutate a surface reports false and the tab is hidden. This is a capability
@@ -83,11 +91,15 @@ export interface Backend {
   deleteSession?(sessionID: string): Promise<boolean>
   updateSession?(sessionID: string, patch: { title?: string }): Promise<Session>
   compactSession?(sessionID: string, providerID: string, modelID: string): Promise<boolean>
-  respondPermission?(permissionID: string, response: "once" | "always" | "reject"): Promise<boolean>
+  /**
+   * v2 permissions are session-scoped, so the session the request belongs to
+   * is part of the reply contract (the request itself also carries sessionID).
+   */
+  respondPermission?(sessionID: string, permissionID: string, response: "once" | "always" | "reject"): Promise<boolean>
   listPermissions?(): Promise<PermissionRequest[]>
   listQuestions?(): Promise<QuestionRequest[]>
-  replyQuestion?(requestID: string, answers: string[][]): Promise<boolean>
-  rejectQuestion?(requestID: string): Promise<boolean>
+  replyQuestion?(sessionID: string, requestID: string, answers: string[][]): Promise<boolean>
+  rejectQuestion?(sessionID: string, requestID: string): Promise<boolean>
   listAgents?(): Promise<AgentInfo[]>
   listCommands?(): Promise<CommandInfo[]>
   listSkills?(): Promise<SkillInfo[]>

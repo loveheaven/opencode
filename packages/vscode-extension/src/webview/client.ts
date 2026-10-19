@@ -129,8 +129,8 @@ export class BackendClient {
     return this.rpc<boolean>("compactSession", [sessionID, providerID, modelID])
   }
 
-  respondPermission(permissionID: string, response: "once" | "always" | "reject"): Promise<boolean> {
-    return this.rpc<boolean>("respondPermission", [permissionID, response])
+  respondPermission(sessionID: string, permissionID: string, response: "once" | "always" | "reject"): Promise<boolean> {
+    return this.rpc<boolean>("respondPermission", [sessionID, permissionID, response])
   }
 
   listPermissions(): Promise<PermissionRequest[]> {
@@ -141,12 +141,12 @@ export class BackendClient {
     return this.rpc<QuestionRequest[]>("listQuestions", [])
   }
 
-  replyQuestion(requestID: string, answers: string[][]): Promise<boolean> {
-    return this.rpc<boolean>("replyQuestion", [requestID, answers])
+  replyQuestion(sessionID: string, requestID: string, answers: string[][]): Promise<boolean> {
+    return this.rpc<boolean>("replyQuestion", [sessionID, requestID, answers])
   }
 
-  rejectQuestion(requestID: string): Promise<boolean> {
-    return this.rpc<boolean>("rejectQuestion", [requestID])
+  rejectQuestion(sessionID: string, requestID: string): Promise<boolean> {
+    return this.rpc<boolean>("rejectQuestion", [sessionID, requestID])
   }
 
   listAgents(): Promise<AgentInfo[]> {

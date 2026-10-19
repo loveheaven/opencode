@@ -2,7 +2,7 @@
   "name": "opencode-vscode",
   "displayName": "OpenCode",
   "description": "OpenCode chat inside VSCode. Talks to a local opencode server over its HTTP API.",
-  "version": "0.26.42",
+  "version": "0.26.45",
   "private": true,
   "publisher": "opencode-ai",
   "engines": {
@@ -135,6 +135,11 @@
             "Drive deepseek-harness (dsh) through the Agent Client Protocol.",
             "Drive pi through its headless JSONL RPC protocol."
           ]
+        },
+        "opencode.serverPassword": {
+          "type": "string",
+          "default": "",
+          "description": "Password for the opencode v2 server's HTTP auth. Empty = adopt OPENCODE_PASSWORD/OPENCODE_SERVER_PASSWORD from the environment, or auto-generate and persist one. Set this to attach to an already-running server you started elsewhere."
         },
         "opencode.dsh.command": {
           "type": "string",

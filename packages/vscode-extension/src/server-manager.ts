@@ -18,11 +18,19 @@ export class ServerManager implements vscode.Disposable {
   private readonly emitter = new vscode.EventEmitter<ServerStatus>()
   private readonly output: vscode.OutputChannel
   private stopping = false
+  // v2 auth password, set by the view provider before spawning. Adopted by the
+  // server via OPENCODE_PASSWORD/OPENCODE_SERVER_PASSWORD so the spawned server
+  // and the backend agree on the same credential.
+  private password: string | undefined
 
   readonly onStatusChanged = this.emitter.event
 
   constructor(output: vscode.OutputChannel) {
     this.output = output
+  }
+
+  setPassword(password: string): void {
+    this.password = password
   }
 
   getStatus(): ServerStatus {
@@ -106,7 +114,14 @@ export class ServerManager implements vscode.Disposable {
       // wrapper and the actual server keeps holding the port on the next reload.
       child = spawn(launcher.command, launcher.args, {
         cwd: launcher.cwd,
-        env: { ...process.env, OPENCODE_SERVER_PASSWORD: process.env.OPENCODE_SERVER_PASSWORD ?? "" },
+        // The v2 server adopts OPENCODE_PASSWORD (or OPENCODE_SERVER_PASSWORD)
+        // as its auth password. Set both to the resolved value so an outer
+        // OPENCODE_PASSWORD can't silently override the one the backend uses.
+        env: {
+          ...process.env,
+          OPENCODE_PASSWORD: this.password ?? "",
+          OPENCODE_SERVER_PASSWORD: this.password ?? "",
+        },
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
       })
@@ -263,15 +278,16 @@ export class ServerManager implements vscode.Disposable {
       }
     }
 
-    // 2. Source checkout via bun (developer mode).
+    // 2. Source checkout via bun (developer mode). The v2 CLI lives in
+    // packages/cli (the old packages/opencode server package was removed).
     if (repoRoot) {
       const bun = resolveBunPath(this.output)
-      const opencodeDir = path.join(repoRoot, "packages", "opencode")
+      const cliDir = path.join(repoRoot, "packages", "cli")
       return {
         mode: "bun-source",
         command: bun,
-        cwd: opencodeDir,
-        args: ["run", "--conditions=browser", "./src/index.ts", ...commonArgs],
+        cwd: cliDir,
+        args: ["run", "./src/index.ts", ...commonArgs],
       }
     }
 
@@ -408,11 +424,11 @@ function findRepoRoot(output?: vscode.OutputChannel): string | undefined {
 
 function isRepoRoot(dir: string): boolean {
   try {
-    const pkg = path.join(dir, "packages", "opencode", "package.json")
+    const pkg = path.join(dir, "packages", "cli", "package.json")
     if (!fs.existsSync(pkg)) return false
     const raw = fs.readFileSync(pkg, "utf8")
     const parsed = JSON.parse(raw)
-    return parsed?.name === "opencode"
+    return parsed?.name === "@opencode/cli"
   } catch {
     return false
   }
@@ -496,75 +512,83 @@ function waitForReady(url: string, timeoutMs: number): Promise<boolean> {
   })
 }
 
-// Positive identification: is the server at `url` an opencode server (as
-// opposed to some other HTTP service that happens to have taken over the
-// port after a crash / user reboot / etc.)? Used before we agree to attach
-// to a previously-remembered URL on startup.
-//
-// Strategy: GET /doc — opencode serves its OpenAPI spec there (see
-// packages/opencode/src/server/routes/instance/httpapi/server.ts, docRoute).
-// A response whose body contains the "opencode" string is treated as ours.
-// If the endpoint doesn't answer, or the body doesn't look like opencode's
-// spec, we return false so the caller falls back to spawning fresh.
-export function identifyOpencode(url: string, timeoutMs = 2000): Promise<boolean> {
+export type OpencodeVersion = "v1" | "v2"
+
+// Result of probing a URL to figure out which opencode generation it serves
+// and whether we can authenticate to it (v2 authenticates every route).
+export type OpencodeProbe =
+  | { kind: "v1" }
+  | { kind: "v2"; authenticated: boolean }
+  | { kind: "unknown" }
+
+// Single GET returning the status code and a capped body (lowercased). Used to
+// tell the two opencode generations apart: v1 serves /doc, v2 serves
+// /openapi.json.
+function probeHttp(
+  url: string,
+  path: string,
+  password: string | undefined,
+  timeoutMs: number,
+): Promise<{ status: number; body: string }> {
   return new Promise((resolve) => {
     let parsed: URL
     try {
       parsed = new URL(url)
     } catch {
-      resolve(false)
+      resolve({ status: 0, body: "" })
       return
     }
+    const headers: Record<string, string> = {}
+    if (password) headers.authorization = `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`
     const req = http.request(
-      {
-        method: "GET",
-        hostname: parsed.hostname,
-        port: parsed.port || 80,
-        path: "/doc",
-        timeout: timeoutMs,
-      },
+      { method: "GET", hostname: parsed.hostname, port: parsed.port || 80, path, timeout: timeoutMs, headers },
       (res) => {
-        // /doc is an authenticated route; without a session cookie it may
-        // return 401/403. Any of those still tells us "this is opencode",
-        // because the endpoint exists — we just aren't authorised. A
-        // random HTTP service on the port wouldn't respond on /doc at all
-        // (it would 404, or return content that doesn't mention opencode).
-        // So we accept 2xx bodies that mention opencode, and treat 401/403
-        // as a positive match without reading the body.
         const status = res.statusCode ?? 0
-        if (status === 401 || status === 403) {
-          res.resume()
-          resolve(true)
-          return
-        }
-        if (status < 200 || status >= 300) {
-          res.resume()
-          resolve(false)
-          return
-        }
+        const chunks: Buffer[] = []
         let received = 0
         const cap = 64 * 1024
-        const chunks: Buffer[] = []
         res.on("data", (chunk: Buffer) => {
           if (received >= cap) return
           const remaining = cap - received
           chunks.push(remaining >= chunk.length ? chunk : chunk.subarray(0, remaining))
           received += Math.min(chunk.length, remaining)
         })
-        res.on("end", () => {
-          const body = Buffer.concat(chunks).toString("utf8").toLowerCase()
-          resolve(body.includes("opencode"))
-        })
-        res.on("error", () => resolve(false))
+        res.on("end", () => resolve({ status, body: Buffer.concat(chunks).toString("utf8").toLowerCase() }))
+        res.on("error", () => resolve({ status, body: "" }))
       },
     )
     req.on("timeout", () => {
       req.destroy()
-      resolve(false)
+      resolve({ status: 0, body: "" })
     })
-    req.on("error", () => resolve(false))
+    req.on("error", () => resolve({ status: 0, body: "" }))
     req.end()
   })
+}
+
+// Detect which opencode generation the server at `url` speaks.
+//
+//   • v2: GET /openapi.json exists — 200 means the given credential is valid,
+//     401/403 means it's a v2 server but the credential is missing/wrong.
+//   • v1: /openapi.json 404s, but GET /doc returns the v1 OpenAPI spec whose
+//     body mentions "opencode".
+//   • unknown: neither — some other HTTP service, or nothing listening.
+export async function probeOpencode(url: string, password?: string, timeoutMs = 2000): Promise<OpencodeProbe> {
+  const openapi = await probeHttp(url, "/openapi.json", password, timeoutMs)
+  if (openapi.status === 200) return { kind: "v2", authenticated: true }
+  if (openapi.status === 401 || openapi.status === 403) return { kind: "v2", authenticated: false }
+  const doc = await probeHttp(url, "/doc", undefined, timeoutMs)
+  if (doc.status === 200 && doc.body.includes("opencode")) return { kind: "v1" }
+  return { kind: "unknown" }
+}
+
+// Positive identification: is the server at `url` an opencode server of *some*
+// generation (v1 or v2)? Used before agreeing to attach to a URL. A random
+// service wouldn't serve /openapi.json (v2) nor /doc (v1), so we fall back to
+// spawning fresh.
+export async function identifyOpencode(url: string, timeoutMs = 2000): Promise<boolean> {
+  const probe = await probeOpencode(url, undefined, timeoutMs)
+  return probe.kind !== "unknown"
 }
 
 // Exported so extension.ts can reuse this on the external-mode fast-path
@@ -749,7 +773,7 @@ async function reapStrayServersOnPort(port: number, output: vscode.OutputChannel
     //   • opencode-cli: `opencode serve ...` (installed binary)
     // Both include `serve --port` and `--hostname 127.0.0.1`, which is a
     // strong signal it's ours and not the user's own opencode invocation.
-    const isSourceMode = cmd.includes("src/index.ts serve") && cmd.includes("--conditions=browser")
+    const isSourceMode = cmd.includes("src/index.ts serve")
     const isCliMode = /\bopencode\s+serve\b/.test(cmd) && cmd.includes("--hostname 127.0.0.1")
     if (!isSourceMode && !isCliMode) {
       output.appendLine(`[opencode-ext] reap: pid=${pid} occupies port ${port} but is not an opencode server (cmd: ${cmd}); leaving it alone.`)

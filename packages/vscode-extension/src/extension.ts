@@ -2,12 +2,13 @@ import * as vscode from "vscode"
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import * as http from "node:http"
+import { randomBytes } from "node:crypto"
 import { URL } from "node:url"
-import { ServerManager, identifyOpencode, probeOnce, type ServerStatus } from "./server-manager"
+import { ServerManager, identifyOpencode, probeOpencode, probeOnce, type ServerStatus } from "./server-manager"
 import type { AttachmentPayload, BootstrapMessage, ExtensionMessage, WebviewRequest } from "./api"
 import { pathToFileURL } from "node:url"
 import type { Backend } from "./backend"
-import { OpencodeBackend } from "./backend/opencode"
+import { OpencodeV1Backend, OpencodeV2Backend } from "./backend/opencode"
 import { DshBackend } from "./backend/dsh"
 import { PiBackend } from "./backend/pi"
 import { scanRunningBackends } from "./backend/process-scan"
@@ -29,6 +30,12 @@ const DEBUG_LOG_KEY = "opencode.debugLog"
 // it's shared across workspaces — pick one running server and every window
 // finds it.
 const LAST_SERVER_URL_KEY = "opencode.lastServerUrl"
+// The v2 server (packages/server) authenticates every route with
+// `Authorization: Basic base64("opencode:<password>")`. The password is adopted
+// from OPENCODE_PASSWORD / OPENCODE_SERVER_PASSWORD at spawn time; if neither
+// is present the extension generates one and persists it here so a later
+// reattach uses the same credential the running server was started with.
+const SERVER_PASSWORD_KEY = "opencode.serverPassword"
 // Cap for logged bodies. Prompt/streaming responses can be many megabytes;
 // truncating keeps the output panel responsive while still surfacing enough
 // to reproduce most bugs.
@@ -245,8 +252,29 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
         cwd: getConfig().get<string>("pi.cwd", "") || directory || process.cwd(),
       })
     } else {
+      // The v2 server authenticates every route (Basic opencode:<password>);
+      // v1 does not. Resolve the password once and hand it to the spawned
+      // server (so a v2 spawn adopts it). The same value is reused on reattach,
+      // which is what makes "attach to the same server next time" keep working.
+      this.server.setPassword(this.serverPassword())
       this.lastServerUrl = await this.resolveServerUrlWithFallback()
-      this.backend = new OpencodeBackend({ baseUrl: this.lastServerUrl ?? "", directory })
+      // Both opencode generations share the Backend interface but differ on
+      // routes/events/message model; pick the matching implementation.
+      const baseUrl = this.lastServerUrl ?? ""
+      const probe = baseUrl ? await probeOpencode(baseUrl, this.serverPassword()) : { kind: "unknown" as const }
+      if (probe.kind === "v1") {
+        this.output.appendLine(`[opencode-ext] server is opencode v1; using v1 backend`)
+        this.backend = new OpencodeV1Backend({ baseUrl, directory })
+      } else {
+        if (probe.kind === "unknown") {
+          this.output.appendLine(`[opencode-ext] could not determine server version; assuming v2`)
+        }
+        this.backend = new OpencodeV2Backend({
+          baseUrl,
+          directory,
+          password: this.serverPassword(),
+        })
+      }
     }
     this.backend.subscribe({
       onUpdate: (u) => this.view?.webview.postMessage({ type: "backend.update", update: u }),
@@ -284,8 +312,14 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
     const lastUrl = this.getLastServerUrl()
     if (lastUrl) {
       this.output.appendLine(`[opencode-ext] probing last-known server ${lastUrl}`)
-      if (await identifyOpencode(lastUrl)) {
-        this.output.appendLine(`[opencode-ext] reattached to ${lastUrl}`)
+      // Reattach only if we can actually use it: a v1 server (no auth) or a v2
+      // server we can authenticate to. A v2 server with a different/lost
+      // password is reattached-and-then-everything-401s otherwise, so treat it
+      // as stale and spawn fresh.
+      const probe = await probeOpencode(lastUrl, this.serverPassword())
+      const reusable = probe.kind === "v1" || (probe.kind === "v2" && probe.authenticated)
+      if (reusable) {
+        this.output.appendLine(`[opencode-ext] reattached to ${lastUrl} (${probe.kind})`)
         // Seed ServerManager status too, so getStatus() reflects the
         // reattached URL (settings display + reload() cache depend on it).
         const status = await this.server.ensureRunning(lastUrl)
@@ -295,7 +329,7 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
           return status.url
         }
       } else {
-        this.output.appendLine(`[opencode-ext] last-known ${lastUrl} not opencode (or gone); spawning`)
+        this.output.appendLine(`[opencode-ext] last-known ${lastUrl} not reusable (${probe.kind}); spawning`)
       }
     }
 
@@ -307,6 +341,27 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
     }
     this.activeSource = undefined
     return undefined
+  }
+
+  // Resolve the v2 server password, in priority order:
+  //   1. `opencode.serverPassword` setting (pinned by the user).
+  //   2. OPENCODE_PASSWORD / OPENCODE_SERVER_PASSWORD in the environment —
+  //      matches what `opencode serve` itself adopts when run standalone.
+  //   3. A random value generated once and persisted in globalState, so a
+  //      later reattach (extension host restart) reuses the same credential
+  //      the still-running server was started with.
+  private serverPassword(): string {
+    const configured = getConfig().get<string>("serverPassword", "").trim()
+    if (configured) return configured
+    const env = process.env.OPENCODE_PASSWORD ?? process.env.OPENCODE_SERVER_PASSWORD
+    if (env) return env
+    let password = this.context.globalState.get<string>(SERVER_PASSWORD_KEY)
+    if (!password) {
+      password = randomBytes(32).toString("base64url")
+      void this.context.globalState.update(SERVER_PASSWORD_KEY, password)
+      this.output.appendLine(`[opencode-ext] generated a server password; persisted to globalState`)
+    }
+    return password
   }
 
   private getLastServerUrl(): string | undefined {
@@ -719,15 +774,19 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
       case "compactSession":
         return b.compactSession?.(args[0] as string, args[1] as string, args[2] as string)
       case "respondPermission":
-        return b.respondPermission?.(args[0] as string, args[1] as "once" | "always" | "reject")
+        return b.respondPermission?.(
+          args[0] as string,
+          args[1] as string,
+          args[2] as "once" | "always" | "reject",
+        )
       case "listPermissions":
         return b.listPermissions?.() ?? []
       case "listQuestions":
         return b.listQuestions?.() ?? []
       case "replyQuestion":
-        return b.replyQuestion?.(args[0] as string, args[1] as string[][])
+        return b.replyQuestion?.(args[0] as string, args[1] as string, args[2] as string[][])
       case "rejectQuestion":
-        return b.rejectQuestion?.(args[0] as string)
+        return b.rejectQuestion?.(args[0] as string, args[1] as string)
       case "listAgents":
         return b.listAgents?.() ?? []
       case "listCommands":
