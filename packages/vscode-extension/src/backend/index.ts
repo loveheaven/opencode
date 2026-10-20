@@ -45,6 +45,8 @@ export type PromptInput = {
   attachments?: Array<{ mime: string; url: string; filename?: string }>
   agent?: string
   model?: { providerID: string; modelID: string }
+  /** Skill ids to attach to this prompt (v2 `skills: [{ id }]`). */
+  skills?: string[]
 }
 
 export type BackendStatus =

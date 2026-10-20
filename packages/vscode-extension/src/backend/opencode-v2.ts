@@ -115,6 +115,26 @@ type OpenCompactionMessage = OpenMessageBase & {
 
 type OpenMessage = OpenUserMessage | OpenAssistantMessage | OpenCompactionMessage | OpenMessageBase
 
+// POST /api/session/:id/prompt returns the *admitted inbox item*, not the flat
+// message shape getMessages returns. Its user text/files live under `payload`.
+type OpenPromptItem = {
+  id: string
+  sessionID?: string
+  time?: { created?: number }
+  type: string
+  payload?: {
+    text?: string
+    files?: Array<{
+      data?: string
+      mime?: string
+      source?: { type: string; uri?: string }
+      name?: string
+      description?: string
+    }>
+  }
+  delivery?: string
+}
+
 type OpenAgentInfo = {
   id?: string
   name?: string
@@ -158,6 +178,7 @@ type OpenFormField = {
   type: string
   title?: string
   description?: string
+  custom?: boolean
   options?: Array<{ value: string; label: string; description?: string }>
 }
 
@@ -342,7 +363,8 @@ export class OpencodeV2Backend implements Backend {
       body.files = input.attachments.map((a) => ({ uri: a.url, name: a.filename }))
     }
     if (input.agent) body.agents = [{ name: input.agent }]
-    const res = await this.json<{ data?: OpenMessage }>(`${sessionPath}/prompt`, { method: "POST", body })
+    if (input.skills?.length) body.skills = input.skills.map((id) => ({ id }))
+    const res = await this.json<{ data?: OpenPromptItem }>(`${sessionPath}/prompt`, { method: "POST", body })
     // The v2 event stream never emits a "user message created" event (see
     // packages/schema/src/session-event.ts — every event is an assistant
     // execution event). Without this the webview only shows the user's own
@@ -407,13 +429,15 @@ export class OpencodeV2Backend implements Backend {
       `/api/session/${encodeURIComponent(sessionID)}/form/${encodeURIComponent(requestID)}`,
     )
     const fields = detail.data?.fields ?? []
-    const flat = (answers ?? []).flat()
     const answer: Record<string, unknown> = {}
+    // `answers` is indexed per question (one entry per field). Do not flatten:
+    // a multiselect field keeps its whole selection array, and a single-select
+    // field takes its first value, keyed by that field's own key.
     fields.forEach((field, i) => {
-      const value = flat[i]
-      if (value === undefined) return
-      if (field.type === "multiselect") answer[field.key] = [value]
-      else answer[field.key] = value
+      const selected = answers?.[i] ?? []
+      if (selected.length === 0) return
+      if (field.type === "multiselect") answer[field.key] = selected
+      else answer[field.key] = selected[0]
     })
     await this.json<void>(`/api/session/${encodeURIComponent(sessionID)}/form/${encodeURIComponent(requestID)}/reply`, {
       method: "POST",
@@ -804,18 +828,43 @@ export class OpencodeV2Backend implements Backend {
    * The v2 event bus has no "user message created" event, so the webview
    * would otherwise not render the user's own bubble until the turn finishes
    * and the 3s sync poll reloads. The prompt response already carries the
-   * persisted message (id minted by the server), so we translate it and emit
-   * the same message.upsert + part.upsert sequence the renderer consumes —
-   * keeping the id in the server's id-space.
+   * persisted message (id minted by the server), so we surface it through the
+   * normal message/part path — keeping the id in the server's id-space.
    */
-  private emitUserMessage(sessionID: string, msg: OpenMessage | undefined): void {
-    if (!msg) return
-    const translated = translateMessage(msg)
-    if (!translated) return
-    const { parts, ...info } = translated
-    this.emitMessage({ ...info, sessionID })
+  private emitUserMessage(sessionID: string, item: OpenPromptItem | undefined): void {
+    if (!item) return
+    const text = item.payload?.text
+    const files = item.payload?.files ?? []
+    if (!text && files.length === 0) return
+    const parts: Part[] = []
+    if (text) parts.push({ id: textPartID(item.id, "text", 0), type: "text", text })
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i]
+      // materializeAttachment returns the file content as `{ data, mime, source }`
+      // (base64), not a plain `uri`. Rebuild a usable URL so image attachments
+      // still render as a preview and other files keep their name badge.
+      const url =
+        f.source?.type === "uri" && f.source.uri
+          ? f.source.uri
+          : f.data && f.mime
+            ? `data:${f.mime};base64,${f.data}`
+            : ""
+      parts.push({
+        id: `${item.id}/file/${i}`,
+        type: "file",
+        mime: f.mime ?? "",
+        url,
+        filename: f.name,
+      })
+    }
+    this.emitMessage({
+      id: item.id,
+      role: "user",
+      sessionID,
+      time: { created: item.time?.created ?? 0 },
+    })
     for (const part of parts) {
-      this.emit({ kind: "part.upsert", sessionID, messageID: translated.id, part })
+      this.emit({ kind: "part.upsert", sessionID, messageID: item.id, part })
     }
   }
 
@@ -1015,14 +1064,26 @@ function toPermissionRequest(p: OpenPermissionRequest): PermissionRequest {
 }
 
 function toQuestionRequest(f: OpenFormInfo): QuestionRequest {
-  const options = (f.fields ?? [])
+  // Each form field is one question (see toField in
+  // packages/core/src/tool/plugin/question.ts): field.description holds the
+  // question text, field.title holds the per-question header, and
+  // field.type is "multiselect" for multi-select questions. Mapping every
+  // field to its own entry keeps the questions distinct instead of
+  // collapsing them into a single card with every option merged together.
+  const questions = (f.fields ?? [])
     .filter((field) => field.type === "string" || field.type === "multiselect")
-    .flatMap((field) => (field.options ?? []).map((o) => ({ label: o.label, description: o.description ?? "" })))
+    .map((field) => ({
+      question: field.description ?? field.title ?? "",
+      header: field.title ?? "",
+      options: (field.options ?? []).map((o) => ({ label: o.label, description: o.description ?? "" })),
+      multiple: field.type === "multiselect",
+      custom: field.custom !== false,
+    }))
   const tool = f.metadata?.tool
   return {
     id: f.id,
     sessionID: f.sessionID,
-    questions: [{ question: f.title ?? "", header: f.title ?? "", options, multiple: false, custom: true }],
+    questions: questions.length > 0 ? questions : [{ question: f.title ?? "", header: f.title ?? "", options: [], multiple: false, custom: true }],
     // Bind the pending request back to the running `question` tool part via
     // (messageID, callID). Without this, findPendingQuestionForTool never
     // matches and the bubble renders the "Question (loading…)" placeholder

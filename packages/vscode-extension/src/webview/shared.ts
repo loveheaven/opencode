@@ -17,7 +17,7 @@
 //     modules don't each need to receive them as init params.
 
 import type { MessageInfo, Part, QuestionRequest, Session } from "../model"
-import type { AgentInfo, CommandInfo, ProviderInfo } from "../types"
+import type { AgentInfo, CommandInfo, ProviderInfo, SkillInfo } from "../types"
 import type { BackendClient } from "./client"
 
 export type MessageEntry = { info: MessageInfo; parts: Map<string, Part>; partOrder: string[] }
@@ -43,6 +43,7 @@ export type State = {
   agents: AgentInfo[]
   providers: ProviderInfo[]
   commands: CommandInfo[]
+  skills: SkillInfo[]
   agent: string
   model: string // "providerID/modelID"
   busy: boolean
@@ -61,6 +62,7 @@ export const state: State = {
   agents: [],
   providers: [],
   commands: [],
+  skills: [],
   agent: "",
   model: "",
   busy: false,

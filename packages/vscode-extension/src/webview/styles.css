@@ -699,6 +699,17 @@ html, body, #app {
   font-weight: 600;
   min-width: 90px;
 }
+.command-palette-kind {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
+  flex-shrink: 0;
+  align-self: center;
+}
 .command-palette-desc {
   color: var(--vscode-descriptionForeground);
   overflow: hidden;

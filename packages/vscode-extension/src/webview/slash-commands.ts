@@ -9,15 +9,20 @@
 // `setSlashCommands`) and the textarea. It renders its own floating DOM
 // element so the palette can escape the composer's layout.
 
-import type { CommandInfo } from "../types"
+import type { CommandInfo, SkillInfo } from "../types"
+
+/** A unified palette row: an opencode `/command` or an attachable skill. */
+export type PaletteEntry =
+  | { kind: "command"; name: string; description?: string }
+  | { kind: "skill"; name: string; description?: string }
 
 let inputEl: HTMLTextAreaElement | null = null
-let commands: readonly CommandInfo[] = []
+let entries: readonly PaletteEntry[] = []
 let onSubmit: () => void = () => {}
 
 let paletteEl: HTMLElement | null = null
 let paletteIndex = 0
-let paletteMatches: CommandInfo[] = []
+let paletteMatches: PaletteEntry[] = []
 
 /**
  * Wire the textarea + submit-on-Cmd-Enter callback. Called once from setup().
@@ -35,9 +40,17 @@ export function initSlashCommands(deps: {
   deps.input.addEventListener("keydown", onInputKeydown)
 }
 
-/** Called whenever bootstrap / refresh loads a fresh command list. */
-export function setSlashCommands(list: readonly CommandInfo[]) {
-  commands = list
+/**
+ * Called whenever bootstrap / refresh loads fresh command + skill lists.
+ * Commands come first, then skills, so `/` surfaces both. Both are completed
+ * as a leading `/name ` token; sendPrompt() routes the name to the command
+ * system or attaches it as a skill (see main.ts).
+ */
+export function setSlashCommands(commands: readonly CommandInfo[], skills: readonly SkillInfo[] = []) {
+  entries = [
+    ...commands.map((c) => ({ kind: "command" as const, name: c.name, description: c.description })),
+    ...skills.map((s) => ({ kind: "skill" as const, name: s.name, description: s.description })),
+  ]
 }
 
 /** Exposed so external code (sendPrompt, session switch, etc.) can hide. */
@@ -48,7 +61,7 @@ export function hideCommandPalette() {
 }
 
 function currentSlashQuery(): string | null {
-  if (!inputEl || commands.length === 0) return null
+  if (!inputEl || entries.length === 0) return null
   // Only trigger when "/" is at position 0 and the caret is still inside the
   // leading token (no whitespace between "/" and caret).
   const value = inputEl.value
@@ -67,7 +80,7 @@ function onInputChange() {
     return
   }
   const q = query.toLowerCase()
-  paletteMatches = commands.filter(
+  paletteMatches = entries.filter(
     (c) => c.name.toLowerCase().startsWith(q) || (c.description ?? "").toLowerCase().includes(q),
   )
   if (paletteMatches.length === 0) {
@@ -114,7 +127,7 @@ function onInputKeydown(e: KeyboardEvent) {
   }
 }
 
-function completeCommand(cmd: CommandInfo) {
+function completeCommand(cmd: PaletteEntry) {
   if (!inputEl) return
   // Replace the leading /token with the picked command name, keep whatever the
   // user had typed after the space (their arguments), and put the caret at the
@@ -153,6 +166,10 @@ function renderCommandPalette() {
     name.className = "command-palette-name"
     name.textContent = `/${cmd.name}`
     row.appendChild(name)
+    const badge = document.createElement("span")
+    badge.className = "command-palette-kind"
+    badge.textContent = cmd.kind === "skill" ? "skill" : "command"
+    row.appendChild(badge)
     if (cmd.description) {
       const desc = document.createElement("span")
       desc.className = "command-palette-desc"

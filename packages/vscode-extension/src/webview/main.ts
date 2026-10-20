@@ -364,14 +364,17 @@ async function loadAgentsAndProviders() {
     client.listAgents(),
     client.listProviders(),
     client.listCommands(),
+    client.listSkills(),
   ])
   state.agents = results[0].status === "fulfilled" ? results[0].value : []
   state.providers = results[1].status === "fulfilled" ? results[1].value : []
   state.commands = results[2].status === "fulfilled" ? results[2].value : []
-  setSlashCommands(state.commands)
+  state.skills = results[3].status === "fulfilled" ? results[3].value : []
+  setSlashCommands(state.commands, state.skills)
   if (results[0].status === "rejected") log("listAgents failed", results[0].reason)
   if (results[1].status === "rejected") log("listProviders failed", results[1].reason)
   if (results[2].status === "rejected") log("listCommands failed", results[2].reason)
+  if (results[3].status === "rejected") log("listSkills failed", results[3].reason)
 
   const persistedAgent = persisted.getAgent(state.directory)
   const persistedModel = persisted.getModel(state.directory)
@@ -392,17 +395,19 @@ async function refreshProviders() {
   if (!client) return
   setStatus("Reloading providers…")
   try {
-    const [agents, providers, commands] = await Promise.all([
+    const [agents, providers, commands, skills] = await Promise.all([
       client.listAgents(),
       client.listProviders(),
       client.listCommands(),
+      client.listSkills(),
     ])
     state.agents = agents
     state.providers = providers
     state.commands = commands
-    setSlashCommands(state.commands)
+    state.skills = skills
+    setSlashCommands(state.commands, state.skills)
     renderAgentModel()
-    setStatus(`Reloaded: ${providers.length} providers, ${commands.length} commands`)
+    setStatus(`Reloaded: ${providers.length} providers, ${commands.length} commands, ${skills.length} skills`)
   } catch (err) {
     setStatus(`Reload failed: ${(err as Error).message}`)
   }
@@ -515,6 +520,10 @@ async function sendPrompt() {
   const commandName = slashMatch?.[1]
   const commandArgs = slashMatch?.[2] ?? ""
   const isKnownCommand = !!commandName && state.commands.some((c) => c.name === commandName)
+  // A leading "/skill-name" that matches a discovered skill attaches that skill
+  // to the prompt (v2 `skills: [{ id }]`) and sends the rest as the text.
+  // Commands win if a name somehow collides.
+  const skillName = !isKnownCommand && commandName && state.skills.some((s) => s.name === commandName) ? commandName : undefined
 
   refs.input.value = ""
   clearAttachments()
@@ -533,10 +542,11 @@ async function sendPrompt() {
     } else {
       await client.prompt({
         sessionID: state.sessionID,
-        text,
+        text: skillName ? commandArgs : text,
         attachments: attachments.map((a) => ({ mime: a.mime, url: a.url, filename: a.filename })),
         agent: state.agent || undefined,
         model,
+        skills: skillName ? [skillName] : undefined,
       })
     }
   } catch (err) {
