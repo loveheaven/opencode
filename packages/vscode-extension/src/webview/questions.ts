@@ -119,6 +119,13 @@ export function buildQuestionCard(req: QuestionRequest): HTMLElement {
     // Schema default: custom is true unless explicitly disabled.
     const allowCustom = q.custom !== false
 
+    // Single-select questions keep the option pick and the custom text
+    // mutually exclusive: picking an option clears the custom field, and
+    // typing custom text clears any picked option. These references let
+    // the two controls cross-clear each other's DOM state.
+    const radioInputs: HTMLInputElement[] = []
+    let customInput: HTMLInputElement | null = null
+
     const block = document.createElement("div")
     block.className = "question-block"
 
@@ -145,6 +152,7 @@ export function buildQuestionCard(req: QuestionRequest): HTMLElement {
         input.name = `q_${draftKey}_${qi}`
         input.value = opt.label
         input.checked = draft.selected[qi].has(opt.label)
+        radioInputs.push(input)
         input.addEventListener("change", () => {
           if (multiple) {
             if (input.checked) draft.selected[qi].add(opt.label)
@@ -152,6 +160,9 @@ export function buildQuestionCard(req: QuestionRequest): HTMLElement {
           } else {
             draft.selected[qi].clear()
             if (input.checked) draft.selected[qi].add(opt.label)
+            // Mutual exclusion: picking an option clears the custom text.
+            draft.custom[qi] = ""
+            if (customInput) customInput.value = ""
           }
         })
         const text = document.createElement("span")
@@ -183,8 +194,14 @@ export function buildQuestionCard(req: QuestionRequest): HTMLElement {
       custom.className = "question-custom"
       custom.placeholder = q.options.length > 0 ? "Or type your own answer…" : "Type your answer…"
       custom.value = draft.custom[qi]
+      customInput = custom
       custom.addEventListener("input", () => {
         draft.custom[qi] = custom.value
+        // Mutual exclusion: typing custom text clears any picked option.
+        if (!multiple && custom.value) {
+          draft.selected[qi].clear()
+          for (const radio of radioInputs) radio.checked = false
+        }
       })
       // Enter in the custom field submits.
       custom.addEventListener("keydown", (e) => {
@@ -215,9 +232,14 @@ export function buildQuestionCard(req: QuestionRequest): HTMLElement {
   card.appendChild(actions)
 
   const buildAnswers = (): string[][] =>
-    draft.selected.map((sel, i) => {
-      const answers = Array.from(sel)
+    req.questions.map((q, i) => {
       const trimmed = draft.custom[i].trim()
+      // Single-select is one-or-the-other: a typed custom answer takes
+      // precedence over any picked option, otherwise the picked option (or
+      // nothing) is the answer. Without this the backend's `selected[0]`
+      // drops the custom text whenever an option is also picked.
+      if (trimmed && !(q.multiple === true)) return [trimmed]
+      const answers = Array.from(draft.selected[i])
       if (trimmed) answers.push(trimmed)
       return answers
     })
