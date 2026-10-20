@@ -260,7 +260,13 @@ export class ServerManager implements vscode.Disposable {
     if (forced !== "source") {
       const cli = await resolveOpencodeCli(this.output)
       if (cli) {
-        return { mode: "opencode-cli", command: cli, args: commonArgs, cwd: undefined }
+        // The opencode server is location-scoped (skills, commands, project
+        // config all resolve against its cwd). Spawn it in the workspace
+        // folder rather than inheriting the extension host's cwd (the VSCode
+        // server install dir); otherwise the server reports the wrong location
+        // and skills/commands come back empty.
+        const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+        return { mode: "opencode-cli", command: cli, args: commonArgs, cwd }
       }
       if (forced === "cli") {
         // Explicitly asked for CLI but it's not there — offer to install.

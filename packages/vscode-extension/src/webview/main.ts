@@ -491,7 +491,6 @@ async function sendPrompt() {
   // Allow sending image-only messages ("what's in this?" + pasted image),
   // but block truly empty submits.
   if (!text && attachments.length === 0) return
-  if (state.busy) return
 
   // Catch up on any messages another client (e.g. mobile via boxclaw) wrote
   // into this session while we were idle. Without this, our first assistant
@@ -570,7 +569,10 @@ async function abortCurrent() {
 
 function setBusy(busy: boolean) {
   state.busy = busy
-  refs.sendBtn.hidden = busy
+  // Send stays visible while busy: opencode v2 steers the running execution at
+  // a safe step boundary, so a mid-turn send is a valid interjection, not an
+  // error. Stop is only offered while busy (it hard-interrupts via /interrupt).
+  refs.sendBtn.hidden = false
   refs.stopBtn.hidden = !busy
   refs.input.disabled = false // still let user type the next prompt while assistant works
   if (busy) setStatus("Assistant is working…")
