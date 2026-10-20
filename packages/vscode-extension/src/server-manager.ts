@@ -2,6 +2,7 @@ import * as vscode from "vscode"
 import { execFileSync, spawn, type ChildProcess } from "node:child_process"
 import * as net from "node:net"
 import * as fs from "node:fs"
+import * as os from "node:os"
 import * as path from "node:path"
 import * as http from "node:http"
 import { URL } from "node:url"
@@ -75,53 +76,46 @@ export class ServerManager implements vscode.Disposable {
 
     await this.stop()
 
-    // Prefer a deterministic port derived from the current workspace path.
-    // Same-workspace reload gets the same port so cookies/localStorage stick.
+    // Prefer a deterministic port for the V1 private-server path (same-workspace
+    // reload reuses the port so cookies/localStorage stick). V2 ignores the port
+    // and uses the shared daemon instead.
     const preferred = preferredPort()
-    const preferredSeed = portSeed()
-
-    // Reap only servers occupying THIS workspace's preferred port. Anything
-    // else on the machine — including opencode servers spawned by a sibling
-    // VSCode window opened on a different workspace — is left alone. Without
-    // this narrowing, reap used to sweep every `opencode serve` / `bun run
-    // src/index.ts serve` on the host, which killed the sibling window's
-    // live session mid-stream. See git history for the previous broad match.
     await reapStrayServersOnPort(preferred, this.output)
-
     const port = await pickPort(preferred)
-    const url = `http://127.0.0.1:${port}`
 
-    // Resolve HOW to launch opencode. Order:
-    //  1. `opencode` CLI on PATH (or well-known install dirs) — production path;
-    //     works on Remote-SSH hosts where the user just `npm i -g opencode`.
-    //  2. `bun run ./src/index.ts serve` from an opencode source checkout —
-    //     developer path; picks up local edits without a build step.
-    //  3. If neither exists, offer to install via `npm i -g opencode`.
     const launcher = await this.resolveLauncher(port)
     if (!launcher) return this.status // status already set to error
 
-    this.output.appendLine(`[opencode-ext] Starting opencode server`)
+    // V2: prefer the shared daemon if a healthy one is already registered.
+    if (launcher.generation === "v2") {
+      const existing = readServiceRegistration()
+      if (existing && (await probeOnce(existing.url))) {
+        this.output.appendLine(`[opencode-ext] reusing shared opencode service at ${existing.url}`)
+        this.setStatus({ state: "ready", url: existing.url })
+        return this.status
+      }
+    }
+
+    this.output.appendLine(`[opencode-ext] Starting opencode ${launcher.generation === "v2" ? "shared service" : "server"}`)
     this.output.appendLine(`  mode: ${launcher.mode}`)
     this.output.appendLine(`  bin:  ${launcher.command}`)
     if (launcher.cwd) this.output.appendLine(`  cwd:  ${launcher.cwd}`)
-    this.output.appendLine(`  port: ${port} (preferred=${preferred}, seed="${preferredSeed}")`)
 
     let child: ChildProcess
     try {
-      // detached: true puts the child in its own process group so we can signal
-      // the entire tree (bun run → bun serve, plus any grandchildren) via
-      // process.kill(-pid). Without this, SIGTERM only reaches the top-level
-      // wrapper and the actual server keeps holding the port on the next reload.
+      // detached: true puts the child in its own process group. V2 does NOT
+      // inject OPENCODE_PASSWORD (the daemon mints its own credential and
+      // advertises it in the registration file); V1 adopts the injected one.
       child = spawn(launcher.command, launcher.args, {
         cwd: launcher.cwd,
-        // The v2 server adopts OPENCODE_PASSWORD (or OPENCODE_SERVER_PASSWORD)
-        // as its auth password. Set both to the resolved value so an outer
-        // OPENCODE_PASSWORD can't silently override the one the backend uses.
-        env: {
-          ...process.env,
-          OPENCODE_PASSWORD: this.password ?? "",
-          OPENCODE_SERVER_PASSWORD: this.password ?? "",
-        },
+        env:
+          launcher.generation === "v2"
+            ? { ...process.env }
+            : {
+                ...process.env,
+                OPENCODE_PASSWORD: this.password ?? "",
+                OPENCODE_SERVER_PASSWORD: this.password ?? "",
+              },
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
       })
@@ -133,7 +127,7 @@ export class ServerManager implements vscode.Disposable {
 
     this.proc = child
     this.stopping = false
-    this.setStatus({ state: "starting", url })
+    this.setStatus({ state: "starting", url: launcher.generation === "v2" ? "" : `http://127.0.0.1:${port}` })
 
     child.stdout?.on("data", (chunk: Buffer) => this.output.append(chunk.toString()))
     child.stderr?.on("data", (chunk: Buffer) => this.output.append(chunk.toString()))
@@ -158,11 +152,21 @@ export class ServerManager implements vscode.Disposable {
       this.setStatus({ state: "error", message: `Server process error: ${detail}` })
     })
 
-    const ready = await waitForReady(url, 45000)
-    if (ready) {
-      this.setStatus({ state: "ready", url })
-    } else if (this.status.state !== "error") {
-      this.setStatus({ state: "error", message: `Server did not become ready at ${url} within 45s` })
+    if (launcher.generation === "v2") {
+      const reg = await waitForServiceRegistration(45000)
+      if (reg) {
+        this.setStatus({ state: "ready", url: reg.url })
+      } else if (this.status.state !== "error") {
+        this.setStatus({ state: "error", message: `opencode service did not register within 45s` })
+      }
+    } else {
+      const url = `http://127.0.0.1:${port}`
+      const ready = await waitForReady(url, 45000)
+      if (ready) {
+        this.setStatus({ state: "ready", url })
+      } else if (this.status.state !== "error") {
+        this.setStatus({ state: "error", message: `Server did not become ready at ${url} within 45s` })
+      }
     }
     return this.status
   }
@@ -249,31 +253,33 @@ export class ServerManager implements vscode.Disposable {
   // status (with a helpful message) when nothing suitable is available and
   // the user declines to install.
   private async resolveLauncher(port: number): Promise<Launcher | undefined> {
-    const commonArgs = ["serve", "--port", String(port), "--hostname", "127.0.0.1"]
     const cfg = vscode.workspace.getConfiguration("opencode")
     const forced = (cfg.get<string>("launcher", "auto") || "auto").trim() // auto | cli | source
 
     // A user-provided repo path always wins for "source" mode.
     const repoRoot = forced === "cli" ? undefined : findRepoRoot(this.output)
 
+    // V2 uses the shared `serve --service` daemon; V1 has no such mode and must
+    // run a private `serve --port --hostname`. Pick by the binary's version.
+    const argsFor = (generation: "v1" | "v2") =>
+      generation === "v2" ? ["serve", "--service"] : ["serve", "--port", String(port), "--hostname", "127.0.0.1"]
+
     // 1. opencode CLI (unless the user explicitly forced source mode).
     if (forced !== "source") {
       const cli = await resolveOpencodeCli(this.output)
       if (cli) {
-        // The opencode server is location-scoped (skills, commands, project
-        // config all resolve against its cwd). Spawn it in the workspace
-        // folder rather than inheriting the extension host's cwd (the VSCode
-        // server install dir); otherwise the server reports the wrong location
-        // and skills/commands come back empty.
-        const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
-        return { mode: "opencode-cli", command: cli, args: commonArgs, cwd }
+        const generation = await detectOpencodeBinaryVersion(cli)
+        return { mode: "opencode-cli", command: cli, args: argsFor(generation), cwd: undefined, generation }
       }
       if (forced === "cli") {
         // Explicitly asked for CLI but it's not there — offer to install.
         const installed = await this.offerInstallOpencode()
         if (installed) {
           const after = await resolveOpencodeCli(this.output)
-          if (after) return { mode: "opencode-cli", command: after, args: commonArgs, cwd: undefined }
+          if (after) {
+            const generation = await detectOpencodeBinaryVersion(after)
+            return { mode: "opencode-cli", command: after, args: argsFor(generation), cwd: undefined, generation }
+          }
         }
         this.setStatus({
           state: "error",
@@ -293,7 +299,8 @@ export class ServerManager implements vscode.Disposable {
         mode: "bun-source",
         command: bun,
         cwd: cliDir,
-        args: ["run", "./src/index.ts", ...commonArgs],
+        args: ["run", "./src/index.ts", "serve", "--service"],
+        generation: "v2",
       }
     }
 
@@ -301,7 +308,10 @@ export class ServerManager implements vscode.Disposable {
     const installed = await this.offerInstallOpencode()
     if (installed) {
       const after = await resolveOpencodeCli(this.output)
-      if (after) return { mode: "opencode-cli", command: after, args: commonArgs, cwd: undefined }
+      if (after) {
+        const generation = await detectOpencodeBinaryVersion(after)
+        return { mode: "opencode-cli", command: after, args: argsFor(generation), cwd: undefined, generation }
+      }
     }
     this.setStatus({
       state: "error",
@@ -360,6 +370,7 @@ type Launcher = {
   command: string
   args: string[]
   cwd: string | undefined
+  generation: "v1" | "v2"
 }
 
 function findRepoRoot(output?: vscode.OutputChannel): string | undefined {
@@ -868,5 +879,58 @@ function commandForPid(pid: number, output: vscode.OutputChannel): string | unde
   } catch (err) {
     output.appendLine(`[opencode-ext] reap: cannot read command for pid=${pid}: ${(err as Error).message}`)
     return undefined
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shared background service (opencode `serve --service`)
+// ---------------------------------------------------------------------------
+
+// The shared daemon advertises itself through a registration file in the user's
+// state dir: `{id, version, url, pid, password}` with 0600 perms. Reading it is
+// the complete discovery contract — this is the same file the CLI/TUI/boxapp
+// read via `Service.ensure`, so every opencode client converges on one daemon.
+export function serviceRegistrationPath(): string {
+  const state = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state")
+  return path.join(state, "opencode", "service.json")
+}
+
+export function readServiceRegistration(): { url: string; password?: string } | undefined {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(serviceRegistrationPath(), "utf8")) as {
+      url?: unknown
+      password?: unknown
+    }
+    if (typeof parsed.url !== "string") return undefined
+    return {
+      url: parsed.url,
+      password: typeof parsed.password === "string" ? parsed.password : undefined,
+    }
+  } catch {
+    return undefined
+  }
+}
+
+// Poll the registration file until the daemon advertises its url, or timeout.
+async function waitForServiceRegistration(timeoutMs: number): Promise<{ url: string; password?: string } | undefined> {
+  const start = Date.now()
+  for (;;) {
+    const reg = readServiceRegistration()
+    if (reg) return reg
+    if (Date.now() - start >= timeoutMs) return undefined
+    await new Promise((resolve) => setTimeout(resolve, 300))
+  }
+}
+
+// Detect whether the opencode binary is V1 or V2 by its version string, without
+// spawning a server. V2 stable is 2.x, V2 dev/preview is 0.0.0-<channel>-…; V1
+// is 1.x. Used to pick the serve mode: only V2 has the `--service` shared daemon.
+async function detectOpencodeBinaryVersion(bin: string): Promise<"v1" | "v2"> {
+  try {
+    const out = execFileSync(bin, ["--version"], { encoding: "utf8", timeout: 5000 })
+    const version = out.trim().replace(/^[^\s]*\s+/, "").replace(/^v/, "")
+    return version.startsWith("2.") || version.startsWith("0.0.0-") ? "v2" : "v1"
+  } catch {
+    return "v1"
   }
 }

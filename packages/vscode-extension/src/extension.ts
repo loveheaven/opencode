@@ -4,7 +4,7 @@ import * as path from "node:path"
 import * as http from "node:http"
 import { randomBytes } from "node:crypto"
 import { URL } from "node:url"
-import { ServerManager, identifyOpencode, probeOpencode, probeOnce, type ServerStatus } from "./server-manager"
+import { ServerManager, identifyOpencode, probeOpencode, probeOnce, readServiceRegistration, type ServerStatus } from "./server-manager"
 import type { AttachmentPayload, BootstrapMessage, ExtensionMessage, WebviewRequest } from "./api"
 import { pathToFileURL } from "node:url"
 import type { Backend } from "./backend"
@@ -353,6 +353,11 @@ class OpencodeViewProvider implements vscode.WebviewViewProvider {
   private serverPassword(): string {
     const configured = getConfig().get<string>("serverPassword", "").trim()
     if (configured) return configured
+    // serve --service mints its own password and advertises it in the
+    // registration file; prefer that so reattach and every shared-daemon client
+    // (CLI/TUI/boxapp) agree on one credential.
+    const registered = readServiceRegistration()
+    if (registered?.password) return registered.password
     const env = process.env.OPENCODE_PASSWORD ?? process.env.OPENCODE_SERVER_PASSWORD
     if (env) return env
     let password = this.context.globalState.get<string>(SERVER_PASSWORD_KEY)

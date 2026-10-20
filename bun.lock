@@ -929,7 +929,7 @@
     },
     "packages/vscode-extension": {
       "name": "opencode-vscode",
-      "version": "0.26.50",
+      "version": "0.26.51",
       "dependencies": {
         "@agentclientprotocol/sdk": "1.4.0",
         "highlight.js": "11",
