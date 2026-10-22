@@ -19,6 +19,7 @@
 // path/diff clicks to the extension host.
 
 import { escapeHtml, renderMarkdown } from "./markdown"
+import hljs from "highlight.js/lib/common"
 import type { Message, MessageInfo, Part, TokenUsage, ToolPart } from "../model"
 import { backendLabel, getClient, refs, state, type MessageEntry } from "./shared"
 import { openLightbox } from "./lightbox"
@@ -1313,12 +1314,15 @@ function renderPart(part: Part, messageID: string, streaming = false): HTMLEleme
     const text = (part as { text: string }).text ?? ""
     if (!text) return null
     const div = document.createElement("div")
-    div.className = "tool"
+    div.className = "tool reasoning"
     const header = document.createElement("div")
     header.className = "tool-header"
-    header.innerHTML = `<span class="tool-icon">${svgIcon("brain")}</span><span class="tool-name">reasoning</span>`
+    header.innerHTML = `<span class="tool-icon tool-icon-reasoning">${svgIcon("brain")}</span><span class="tool-name">reasoning</span>`
     const body = document.createElement("div")
-    body.className = streaming ? "tool-body" : "tool-body collapsed"
+    // 默认折叠：reasoning 是模型的思考过程，流式时展开会撑高消息列表、
+    // 抢走滚轮（内层滚动容器），且用户主要想看最终回复。始终折叠，
+    // 点 header 才展开；完成态与流式态表现一致。
+    body.className = "tool-body collapsed"
     body.innerHTML = escapeHtml(text)
     header.addEventListener("click", () => body.classList.toggle("collapsed"))
     div.appendChild(header)
@@ -1748,6 +1752,10 @@ function renderToolIconElement(part: ToolPart): HTMLElement {
     }
   }
 
+  if (part.tool === "bash" || part.tool === "shell") {
+    span.classList.add("tool-icon-shell")
+  }
+
   span.innerHTML = toolIconSvg(part.tool)
   return span
 }
@@ -1975,9 +1983,13 @@ function fillToolBody(body: HTMLElement, part: ToolPart) {
     (typeof input.path === "string" && input.path) ||
     (typeof input.file === "string" && input.file) ||
     ""
+  const isShell = part.tool === "bash" || part.tool === "shell"
+  const command = isShell && typeof input.command === "string" ? (input.command as string) : ""
 
-  // Header keys/values summary
-  const keys = Object.keys(input).filter((k) => k !== "filePath" && k !== "path" && k !== "file")
+  // Header keys/values summary（shell 的 command 单独高亮展示，不放进 kv）
+  const keys = Object.keys(input).filter(
+    (k) => k !== "filePath" && k !== "path" && k !== "file" && !(isShell && k === "command"),
+  )
   if (keys.length > 0) {
     for (const k of keys) {
       const v = input[k]
@@ -1986,6 +1998,14 @@ function fillToolBody(body: HTMLElement, part: ToolPart) {
       line.textContent = `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`
       body.appendChild(line)
     }
+  }
+
+  // shell 命令：按顶层分隔符拆成多行 + bash 语法高亮
+  if (command) {
+    const pre = document.createElement("pre")
+    pre.className = "shell-command"
+    pre.innerHTML = highlightShellCommand(command)
+    body.appendChild(pre)
   }
 
   if (filePath) {
@@ -2021,6 +2041,38 @@ function fillToolBody(body: HTMLElement, part: ToolPart) {
     pre.style.whiteSpace = "pre-wrap"
     pre.style.margin = "6px 0 0 0"
     body.appendChild(pre)
+  }
+}
+
+// 把 shell 命令按顶层（引号外）的分号拆成多行，再做 bash 语法高亮。
+// 让 agent 执行的一条长命令（用 ; 连起来的）在卡片里逐行可读。
+// && / || / | 不换行（它们是同一「语句」里的短路/管道，拆开反而难读）。
+function highlightShellCommand(command: string): string {
+  let out = ""
+  let inSingle = false
+  let inDouble = false
+  let inBacktick = false
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]
+    const prev = command[i - 1]
+    if (ch === "'" && !inDouble && !inBacktick && prev !== "\\") inSingle = !inSingle
+    else if (ch === '"' && !inSingle && !inBacktick && prev !== "\\") inDouble = !inDouble
+    else if (ch === "`" && !inSingle && !inDouble) inBacktick = !inBacktick
+
+    if (inSingle || inDouble || inBacktick) {
+      out += ch
+      continue
+    }
+    if (ch === ";") {
+      out += ";\n"
+    } else {
+      out += ch
+    }
+  }
+  try {
+    return hljs.highlight(out, { language: "bash" }).value
+  } catch {
+    return escapeHtml(out)
   }
 }
 

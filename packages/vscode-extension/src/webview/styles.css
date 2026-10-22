@@ -51,6 +51,13 @@ html, body, #app {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* agent pill uses an emoji (🔨) while model pill uses a symbol (✦); emoji
+   * has a taller line box, so without a fixed height the two pills differ in
+   * height. Pin the height and center the content to keep them identical. */
+  height: 26px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
 }
 .pill:hover { background: var(--vscode-toolbar-hoverBackground); }
 
@@ -58,10 +65,10 @@ html, body, #app {
 #messages {
   flex: 1;
   overflow-y: auto;
-  padding: 12px;
+  padding: 16px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 16px;
   outline: none;
 }
 .msg {
@@ -69,12 +76,17 @@ html, body, #app {
   flex-direction: column;
   gap: 6px;
 }
+/* 用户消息与上方 assistant 输出之间加一条全宽分割线，明确区分「新一轮提问」 */
+.msg.user:not(:first-child) {
+  border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.25));
+  padding-top: 16px;
+}
 .msg.user .bubble {
   align-self: flex-end;
   background: var(--vscode-input-background);
   border: 1px solid var(--vscode-input-border, transparent);
-  border-radius: 8px 8px 2px 8px;
-  padding: 8px 10px;
+  border-radius: 16px 16px 4px 16px;
+  padding: 10px 14px;
   max-width: 92%;
   word-wrap: break-word;
   display: flex;
@@ -288,9 +300,11 @@ html, body, #app {
   padding: 6px 10px;
   cursor: pointer;
   user-select: none;
-  background: color-mix(in srgb, var(--vscode-editor-background) 85%, var(--vscode-foreground) 4%);
+  background: var(--vscode-editor-background);
 }
-.tool-header:hover { filter: brightness(1.05); }
+.tool-header:hover {
+  background: color-mix(in srgb, var(--vscode-editor-background) 80%, var(--vscode-foreground) 20%);
+}
 .tool-icon {
   width: 16px;
   height: 16px;
@@ -307,6 +321,29 @@ html, body, #app {
   width: 16px;
   height: 16px;
   display: block;
+}
+/* Coloured icon chips: reasoning (violet) and shell/terminal (green) get a
+ * tinted rounded background with a matching icon colour so they stand out
+ * from the neutral file-type badges. */
+.tool-icon-reasoning,
+.tool-icon-shell {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  opacity: 1;
+}
+.tool-icon-reasoning {
+  background: rgba(139, 92, 246, 0.16);
+  color: #8b5cf6;
+}
+.tool-icon-shell {
+  background: rgba(34, 197, 94, 0.16);
+  color: #22c55e;
+}
+.tool-icon-reasoning svg,
+.tool-icon-shell svg {
+  width: 12px;
+  height: 12px;
 }
 
 /* File-type badge variant of the tool icon. Rendered for read/edit/write/
@@ -466,6 +503,25 @@ html, body, #app {
   overflow-y: auto;
 }
 .tool-body.collapsed { display: none; }
+/* Reasoning is the model's live "thinking" text, not a bounded tool result.
+   Don't clamp it to a scroll box: while it streams, an inner overflow-y:auto
+   would swallow the wheel and make the outer message list impossible to
+   scroll until the reasoning collapses. Let it grow so the outer list scrolls. */
+.reasoning .tool-body {
+  max-height: none;
+  overflow: visible;
+}
+/* shell 命令（bash/shell 工具卡片里的 command，多行 + hljs 高亮） */
+.tool-body .shell-command {
+  margin: 6px 0 0 0;
+  padding: 8px 10px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--vscode-textCodeBlock-background, rgba(127, 127, 127, 0.1));
+  border-radius: 4px;
+}
 .tool-body .kv {
   color: var(--vscode-descriptionForeground);
   font-size: 11px;
@@ -725,10 +781,10 @@ html, body, #app {
 /* Composer */
 #composer {
   border-top: 1px solid var(--vscode-panel-border, transparent);
-  padding: 8px 10px;
+  padding: 12px 16px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
   background: var(--vscode-sideBar-background, var(--vscode-editor-background));
   flex-shrink: 0;
   position: relative;
@@ -1078,8 +1134,8 @@ body.opencode-dragging * {
   background: var(--vscode-input-background);
   color: var(--vscode-input-foreground);
   border: 1px solid var(--vscode-input-border, transparent);
-  border-radius: 4px;
-  padding: 6px 8px;
+  border-radius: 14px;
+  padding: 10px 14px;
   font: inherit;
   font-family: var(--vscode-editor-font-family, var(--vscode-font-family));
   resize: none;
